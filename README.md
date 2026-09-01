@@ -62,6 +62,7 @@ ADMIN_CHAT_ID=123456789
 DB_PATH=data/monitor.db
 TON_API_KEY=your_tonapi_key
 AUTO_DELETE_DELAY=30
+# TELEGRAM_REQUEST_TIMEOUT=60
 ```
 
 Start the monitor:
@@ -81,6 +82,7 @@ The database is created automatically at `data/monitor.db` unless `DB_PATH` is c
 | `/add <chain> <address> [label]` | Add a wallet with an explicit chain |
 | `/remove <chain> <address>` | Remove a wallet |
 | `/rename <chain> <address> <label>` | Rename a wallet |
+| `/label <chain> <address> <label>` | Set or change a custom wallet label |
 | `/list [chain]` | List monitored wallets |
 | `/report` | Show alert counts by wallet |
 | `/history [limit]` | View alert history, up to 50 records |
@@ -89,12 +91,17 @@ The database is created automatically at `data/monitor.db` unless `DB_PATH` is c
 | `/timezone [zone]` | Set the display timezone |
 | `/stats` | Show your usage statistics |
 | `/status` | Check monitor health |
+| `/ask` | Start a guided question-and-answer session with the built-in local assistant (no API) |
 | `/test` | Send a sample alert |
 | `/export` | Export monitored addresses |
 | `/chains` | List supported networks |
 | `/help` | Show command help |
 
 Administrators can also use `/admin` and `/broadcast <message>` when `ADMIN_CHAT_ID` is configured.
+Use `/admin_user <chat_id>` to view a user’s full profile, wallets, labels, timezone, notification state, and IN/OUT alert totals.
+Admins can manage access with `/ban <chat_id>` and `/unban <chat_id>`. Anti-spam protection applies to regular users but is disabled for admins.
+
+The built-in project assistant is available with `/ask`. The bot asks for your question, then replies in a formatted message. You can also use `/ask <question>` as a one-message shortcut. It analyzes the bot's local configuration and features, so it does not use an AI API or send the question to an external service.
 
 ## Adding wallets
 
