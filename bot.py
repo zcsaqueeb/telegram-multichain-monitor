@@ -1,171 +1,177 @@
 #!/usr/bin/env python3
 """
-🔮 telegram-multichain-monitor
-Monitors: EVM (19 chains) + TON + XLM + SOL + TRON + BTC + Sui
-Detects: ALL tokens — native, ERC-20, Jettons, SPL, TRC-20, Stellar assets
-Features: Per-user timezone, notification history, inline keyboards, stats
-Author: Assistant | License: MIT
+🔮 telegram-multichain-monitor — Optimized
+High-performance multi-chain wallet monitor.
+25 chains | All tokens | IN+OUT | Burn detection | Auto chain | Admin
 """
+
+from __future__ import annotations
 
 import asyncio
 import argparse
 import base64
-import html as html_lib
-from collections import defaultdict, deque
+import html
+import inspect
+import json
 import logging
 import os
 import re
 import sqlite3
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional
+from enum import Enum
+from functools import lru_cache
+from typing import Dict, List, Optional, Set, Tuple, Any
 from zoneinfo import ZoneInfo, available_timezones
 
 import httpx
-from aiogram import BaseMiddleware, Bot, Dispatcher, Router, types, F
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
-from web3.middleware import ExtraDataToPOAMiddleware
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from web3 import AsyncWeb3, Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 from web3.providers import AsyncHTTPProvider
 
 # ═══════════════════════════════════════════════════
-def load_local_env():
-    """Load simple KEY=VALUE entries from the project .env file."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.isfile(env_path):
-        return
-    with open(env_path, encoding="utf-8") as env_file:
-        for raw_line in env_file:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip("\"'")
-            if key:
-                os.environ.setdefault(key, value)
-
-
-load_local_env()
-
-# CONFIGURATION
+# ENVIRONMENT
 # ═══════════════════════════════════════════════════
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-DB_PATH = os.getenv("DB_PATH", "data/monitor.db")
-TON_API_KEY = os.getenv("TON_API_KEY", "")
-EXTRA_EVM_CHAINS = os.getenv("EXTRA_EVM_CHAINS", "")
+def _load_env():
+    path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip("""'""")
+            if k:
+                os.environ.setdefault(k, v)
+
+_load_env()
+
+# ═══════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════
+
+class Config:
+    TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    ADMIN_ID: Optional[int] = int(os.getenv("ADMIN_CHAT_ID")) if os.getenv("ADMIN_CHAT_ID") else None
+    DB_PATH: str = os.getenv("DB_PATH", "data/monitor.db")
+    TON_API_KEY: str = os.getenv("TON_API_KEY", "")
+    EXTRA_EVM: str = os.getenv("EXTRA_EVM_CHAINS", "")
+    AUTO_DELETE: int = int(os.getenv("AUTO_DELETE_DELAY", "30"))
+    TELEGRAM_TIMEOUT: int = int(os.getenv("TELEGRAM_REQUEST_TIMEOUT", "60"))
+    MAX_HISTORY: int = 50
+    NOTIF_BATCH: int = 100
+    ADDR_CACHE_TTL: int = 30  # seconds
+    USER_CACHE_TTL: int = 60  # seconds
+
+# ═══════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════
+
+class _RedactFilter(logging.Filter):
+    _id_pat = re.compile(r"\bid=\d+\b")
+    _url_pat = re.compile(r"https?://[^\s)]+")
+    def filter(self, rec: logging.LogRecord) -> bool:
+        if ("Unclosed client session" in rec.getMessage()
+                or "Unclosed connector" in rec.getMessage()
+                or rec.getMessage().startswith("client_session:")
+                or "Successfully disconnected from:" in rec.getMessage()):
+            return False
+        if rec.levelno == logging.WARNING:
+            return False
+        rec.msg = self._url_pat.sub("[rpc]", self._id_pat.sub("id=***", rec.getMessage()))
+        rec.args = ()
+        return True
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%H:%M:%S",
 )
+# Keep routine framework polling/update messages out of the console.
+logging.getLogger("aiogram").setLevel(logging.WARNING)
+for h in logging.getLogger().handlers:
+    h.addFilter(_RedactFilter())
+logger = logging.getLogger("tmm")
 
+# ═══════════════════════════════════════════════════
+# CHAIN REGISTRY
+# ═══════════════════════════════════════════════════
 
-class RedactTelegramIdFilter(logging.Filter):
-    """Prevent Telegram bot numeric IDs from appearing in console logs."""
-    _pattern = re.compile(r"\bid=\d+\b")
-    _url_pattern = re.compile(r"https?://[^\s)]+")
+@dataclass(frozen=True)
+class ChainCfg:
+    key: str
+    name: str
+    emoji: str
+    type: str
+    native: str
+    poll: int
+    rpc: str = ""
+    rpc_fallbacks: Tuple[str, ...] = ()
+    api: str = ""
+    explorer: str = ""
+    decimals: int = 18
+    chain_id: Optional[int] = None
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno == logging.WARNING:
-            return False
-        message = self._pattern.sub("id=REDACTED", record.getMessage())
-        record.msg = self._url_pattern.sub("[rpc]", message)
-        record.args = ()
-        return True
-
-
-for _handler in logging.getLogger().handlers:
-    _handler.addFilter(RedactTelegramIdFilter())
-
-logger = logging.getLogger("multi-bot")
-
-# ── Chain Registry ─────────────────────────────────
-CHAINS: Dict[str, dict] = {
-    "ethereum":  {"name": "Ethereum",   "emoji": "💠", "type": "evm", "rpc": "https://eth.llamarpc.com",                    "explorer": "https://etherscan.io/tx/",           "native": "ETH",   "poll": 15},
-    "bsc":       {"name": "BSC",        "emoji": "🟡", "type": "evm", "rpc": "https://bsc-dataseed.binance.org/",           "explorer": "https://bscscan.com/tx/",            "native": "BNB",   "poll": 3},
-    "polygon":   {"name": "Polygon",    "emoji": "🟣", "type": "evm", "rpc": "https://polygon.llamarpc.com",                "explorer": "https://polygonscan.com/tx/",        "native": "MATIC", "poll": 2},
-    "arbitrum":  {"name": "Arbitrum",   "emoji": "🔵", "type": "evm", "rpc": "https://arb1.arbitrum.io/rpc",                "explorer": "https://arbiscan.io/tx/",            "native": "ETH",   "poll": 2},
-    "optimism":  {"name": "Optimism",   "emoji": "🔴", "type": "evm", "rpc": "https://mainnet.optimism.io",                 "explorer": "https://optimistic.etherscan.io/tx/","native": "ETH",   "poll": 2},
-    "base":      {"name": "Base",       "emoji": "🔷", "type": "evm", "rpc": "https://mainnet.base.org",                    "explorer": "https://basescan.org/tx/",           "native": "ETH",   "poll": 2},
-    "avalanche": {"name": "Avalanche",  "emoji": "❄️", "type": "evm", "rpc": "https://api.avax.network/ext/bc/C/rpc",       "explorer": "https://snowtrace.io/tx/",           "native": "AVAX",  "poll": 2},
-    "fantom":    {"name": "Fantom",     "emoji": "👻", "type": "evm", "rpc": "https://rpc.ftm.tools",                       "explorer": "https://ftmscan.com/tx/",            "native": "FTM",   "poll": 3},
-    "zksync":    {"name": "zkSync",     "emoji": "⚡", "type": "evm", "rpc": "https://mainnet.era.zksync.io",               "explorer": "https://explorer.zksync.io/tx/",     "native": "ETH",   "poll": 5},
-    "linea":     {"name": "Linea",      "emoji": "📐", "type": "evm", "rpc": "https://rpc.linea.build",                     "explorer": "https://lineascan.build/tx/",        "native": "ETH",   "poll": 5},
-    "scroll":    {"name": "Scroll",     "emoji": "📜", "type": "evm", "rpc": "https://rpc.scroll.io",                       "explorer": "https://scrollscan.com/tx/",         "native": "ETH",   "poll": 5},
-    "mantle":    {"name": "Mantle",     "emoji": "🧱", "type": "evm", "rpc": "https://rpc.mantle.xyz",                      "explorer": "https://mantlescan.xyz/tx/",         "native": "MNT",   "poll": 5},
-    "gnosis":    {"name": "Gnosis",     "emoji": "🦉", "type": "evm", "rpc": "https://rpc.gnosischain.com",                 "explorer": "https://gnosisscan.io/tx/",          "native": "xDAI",  "poll": 5},
-    "celo":      {"name": "Celo",       "emoji": "🌍", "type": "evm", "rpc": "https://forno.celo.org",                      "explorer": "https://celoscan.io/tx/",            "native": "CELO",  "poll": 5},
-    "cronos":    {"name": "Cronos",     "emoji": "🦁", "type": "evm", "rpc": "https://evm.cronos.org",                      "explorer": "https://cronoscan.com/tx/",          "native": "CRO",   "poll": 5},
-    "moonbeam":  {"name": "Moonbeam",   "emoji": "🌙", "type": "evm", "rpc": "https://rpc.api.moonbeam.network",            "explorer": "https://moonscan.io/tx/",            "native": "GLMR",  "poll": 5},
-
-    "ton":  {"name": "TON",     "emoji": "💎", "type": "ton",  "api": "https://tonapi.io/v2",                      "explorer": "https://tonviewer.com/transaction/", "native": "TON",  "poll": 10, "decimals": 9},
-    "xlm":  {"name": "Stellar", "emoji": "✨", "type": "xlm",  "api": "https://horizon.stellar.org",               "explorer": "https://stellar.expert/explorer/public/tx/", "native": "XLM",  "poll": 10, "decimals": 7},
-    "sol":  {"name": "Solana",  "emoji": "🟣", "type": "sol",  "rpc": "https://api.mainnet-beta.solana.com",       "explorer": "https://solscan.io/tx/",             "native": "SOL",  "poll": 5,  "decimals": 9},
-    "tron": {"name": "TRON",    "emoji": "🔴", "type": "tron", "api": "https://api.trongrid.io/v1",                "explorer": "https://tronscan.org/#/transaction/","native": "TRX",  "poll": 5,  "decimals": 6},
-    "btc":  {"name": "Bitcoin", "emoji": "🟠", "type": "btc",  "api": "https://mempool.space/api",                 "explorer": "https://mempool.space/tx/",          "native": "BTC",  "poll": 30, "decimals": 8},
-}
-
-# Extra networks are registered after the core table so the registry remains
-# easy to scan and future EVM networks can also be supplied through config.
-CHAINS.update({
-    "robinhood": {"name": "Robinhood Chain", "emoji": "RH", "type": "evm", "rpc": "https://rpc.mainnet.chain.robinhood.com", "explorer": "https://robinhoodchain.blockscout.com/tx/", "native": "ETH", "poll": 2, "chain_id": 4663},
-    "merlin": {"name": "Merlin Chain", "emoji": "🔥", "type": "evm", "rpc": "https://rpc.merlinchain.io", "explorer": "https://scan.merlinchain.io/tx/", "native": "BTC", "poll": 3, "chain_id": 4200},
-    "hyperevm": {"name": "HyperEVM", "emoji": "H", "type": "evm", "rpc": "https://rpc.hyperliquid.xyz/evm", "explorer": "https://hyperevmscan.io/tx/", "native": "HYPE", "poll": 2, "chain_id": 999},
-    "sui": {"name": "Sui", "emoji": "SUI", "type": "sui", "rpc": "https://fullnode.mainnet.sui.io:443", "explorer": "https://suivision.xyz/txblock/", "native": "SUI", "poll": 5, "decimals": 9},
-})
-
-# Public RPCs can rate-limit or temporarily return 5xx responses. Keep more
-# than one endpoint for the networks with commonly unstable public nodes.
-CHAINS["polygon"]["rpc_fallbacks"] = [
-    "https://polygon.drpc.org",
-    "https://polygon.publicnode.com",
-    "https://1rpc.io/matic",
-]
-CHAINS["cronos"]["rpc_fallbacks"] = [
-    "https://cronos-evm-rpc.publicnode.com",
-    "https://1rpc.io/cro",
+_CHAINS: List[ChainCfg] = [
+    ChainCfg("ethereum",  "Ethereum",   "💠", "evm", "ETH",  15, "https://eth.llamarpc.com",                    ("https://ethereum.publicnode.com","https://1rpc.io/eth","https://rpc.flashbots.net"),                   "", "https://etherscan.io/tx/"),
+    ChainCfg("bsc",       "BSC",        "🟡", "evm", "BNB",   3, "https://bsc-dataseed.binance.org/",           ("https://bsc.publicnode.com","https://1rpc.io/bnb"),                                                   "", "https://bscscan.com/tx/"),
+    ChainCfg("polygon",   "Polygon",    "🟣", "evm", "MATIC", 2, "https://polygon.llamarpc.com",                ("https://polygon.drpc.org","https://polygon.publicnode.com","https://1rpc.io/matic"),                  "", "https://polygonscan.com/tx/"),
+    ChainCfg("arbitrum",  "Arbitrum",   "🔵", "evm", "ETH",   2, "https://arb1.arbitrum.io/rpc",                ("https://arbitrum-one.publicnode.com","https://1rpc.io/arb"),                                          "", "https://arbiscan.io/tx/"),
+    ChainCfg("optimism",  "Optimism",   "🔴", "evm", "ETH",   2, "https://mainnet.optimism.io",                 ("https://optimism.publicnode.com","https://1rpc.io/op"),                                               "", "https://optimistic.etherscan.io/tx/"),
+    ChainCfg("base",      "Base",       "🔷", "evm", "ETH",   2, "https://mainnet.base.org",                    ("https://base.publicnode.com","https://1rpc.io/base"),                                                 "", "https://basescan.org/tx/"),
+    ChainCfg("avalanche", "Avalanche",  "❄️", "evm", "AVAX",  2, "https://api.avax.network/ext/bc/C/rpc",       ("https://avalanche-c-chain.publicnode.com","https://1rpc.io/avax"),                                    "", "https://snowtrace.io/tx/"),
+    ChainCfg("fantom",    "Fantom",     "👻", "evm", "FTM",   3, "https://rpc.ftm.tools",                       ("https://rpcapi.fantom.network/","https://rpc.ankr.com/fantom/","https://fantom-mainnet.public.blastapi.io/","https://fantom.publicnode.com","https://1rpc.io/ftm","https://fantom.blockpi.network/v1/rpc/public","https://fantom.drpc.org/","https://rpc.fantom.gateway.fm","https://endpoints.omniatech.io/v1/fantom/mainnet/public"),                                                "", "https://ftmscan.com/tx/"),
+    ChainCfg("zksync",    "zkSync",     "⚡", "evm", "ETH",   5, "https://mainnet.era.zksync.io",               ("https://zksync-era.publicnode.com","https://1rpc.io/zksync"),                                         "", "https://explorer.zksync.io/tx/"),
+    ChainCfg("linea",     "Linea",      "📐", "evm", "ETH",   5, "https://rpc.linea.build",                     ("https://linea-mainnet.publicnode.com","https://1rpc.io/linea"),                                       "", "https://lineascan.build/tx/"),
+    ChainCfg("scroll",    "Scroll",     "📜", "evm", "ETH",   5, "https://rpc.scroll.io",                       ("https://scroll.publicnode.com","https://1rpc.io/scroll"),                                             "", "https://scrollscan.com/tx/"),
+    ChainCfg("mantle",    "Mantle",     "🧱", "evm", "MNT",   5, "https://rpc.mantle.xyz",                      ("https://mantle.publicnode.com","https://1rpc.io/mantle"),                                             "", "https://mantlescan.xyz/tx/"),
+    ChainCfg("gnosis",    "Gnosis",     "🦉", "evm", "xDAI",  5, "https://rpc.gnosischain.com",                 ("https://gnosis.publicnode.com","https://1rpc.io/gnosis"),                                             "", "https://gnosisscan.io/tx/"),
+    ChainCfg("celo",      "Celo",       "🌍", "evm", "CELO",  5, "https://forno.celo.org",                      ("https://celo.publicnode.com","https://1rpc.io/celo"),                                                 "", "https://celoscan.io/tx/"),
+    ChainCfg("cronos",    "Cronos",     "🦁", "evm", "CRO",   5, "https://evm.cronos.org",                      ("https://cronos-evm-rpc.publicnode.com","https://1rpc.io/cro"),                                        "", "https://cronoscan.com/tx/"),
+    ChainCfg("moonbeam",  "Moonbeam",   "🌙", "evm", "GLMR",  5, "https://rpc.api.moonbeam.network",            ("https://moonbeam.api.onfinality.io/public","https://moonbeam.unitedbloc.com","https://moonbeam.publicnode.com","https://1rpc.io/glmr"),                                             "", "https://moonscan.io/tx/"),
+    ChainCfg("robinhood", "Robinhood",  "RH", "evm", "ETH",   2, "https://rpc.mainnet.chain.robinhood.com",     (),                                                                                                       "", "https://robinhoodchain.blockscout.com/tx/", chain_id=4663),
+    ChainCfg("merlin",    "Merlin",     "🔥", "evm", "BTC",   3, "https://rpc.merlinchain.io",                  (),                                                                                                       "", "https://scan.merlinchain.io/tx/", chain_id=4200),
+    ChainCfg("hyperevm",  "HyperEVM",   "H",  "evm", "HYPE",  2, "https://rpc.hyperliquid.xyz/evm",             (),                                                                                                       "", "https://hyperevmscan.io/tx/", chain_id=999),
+    ChainCfg("ton",       "TON",        "💎", "ton", "TON",  10, "", (), "https://tonapi.io/v2",                    "https://tonviewer.com/transaction/", 9),
+    ChainCfg("xlm",       "Stellar",    "✨", "xlm", "XLM",  10, "", (), "https://horizon.stellar.org",             "https://stellar.expert/explorer/public/tx/", 7),
+    ChainCfg("sol",       "Solana",     "🟣", "sol", "SOL",   5, "https://api.mainnet-beta.solana.com",         (),                                                                                                       "", "https://solscan.io/tx/", 9),
+    ChainCfg("tron",      "TRON",       "🔴", "tron","TRX",   5, "", (), "https://api.trongrid.io/v1",              "https://tronscan.org/#/transaction/", 6),
+    ChainCfg("btc",       "Bitcoin",    "🟠", "btc", "BTC",  30, "", (), "https://mempool.space/api",               "https://mempool.space/tx/", 8),
+    ChainCfg("sui",       "Sui",        "SUI","sui", "SUI",   5, "https://fullnode.mainnet.sui.io:443",         (),                                                                                                       "", "https://suivision.xyz/txblock/", 9),
 ]
 
-# Additional public fallbacks for every EVM network. Operators can override
-# or extend any list with the rpc_fallbacks field in EXTRA_EVM_CHAINS.
-_publicnode_fallbacks = {
-    "ethereum": ["https://ethereum.publicnode.com", "https://1rpc.io/eth", "https://rpc.flashbots.net"],
-    "bsc": ["https://bsc.publicnode.com", "https://1rpc.io/bnb"],
-    "arbitrum": ["https://arbitrum-one.publicnode.com", "https://1rpc.io/arb"],
-    "optimism": ["https://optimism.publicnode.com", "https://1rpc.io/op"],
-    "base": ["https://base.publicnode.com", "https://1rpc.io/base"],
-    "avalanche": ["https://avalanche-c-chain.publicnode.com", "https://1rpc.io/avax"],
-    "fantom": ["https://fantom.publicnode.com", "https://1rpc.io/ftm"],
-    "zksync": ["https://zksync-era.publicnode.com", "https://1rpc.io/zksync"],
-    "linea": ["https://linea-mainnet.publicnode.com", "https://1rpc.io/linea"],
-    "scroll": ["https://scroll.publicnode.com", "https://1rpc.io/scroll"],
-    "mantle": ["https://mantle.publicnode.com", "https://1rpc.io/mantle"],
-    "gnosis": ["https://gnosis.publicnode.com", "https://1rpc.io/gnosis"],
-    "celo": ["https://celo.publicnode.com", "https://1rpc.io/celo"],
-    "moonbeam": ["https://moonbeam.publicnode.com", "https://1rpc.io/glmr"],
-}
-for _chain_key, _fallbacks in _publicnode_fallbacks.items():
-    CHAINS[_chain_key].setdefault("rpc_fallbacks", []).extend(
-        url for url in _fallbacks if url not in CHAINS[_chain_key].get("rpc_fallbacks", [])
-    )
-
-if EXTRA_EVM_CHAINS:
-    import json
+# Parse extra EVM chains from env
+if Config.EXTRA_EVM:
     try:
-        for key, cfg in json.loads(EXTRA_EVM_CHAINS).items():
-            if not isinstance(cfg, dict) or not all(cfg.get(k) for k in ("name", "rpc", "explorer", "native")):
-                raise ValueError(f"invalid chain config for {key}")
-            CHAINS[key.lower()] = {"emoji": "⛓️", "type": "evm", "poll": 5, **cfg}
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("EXTRA_EVM_CHAINS must be a JSON object of chain definitions") from exc
+        for k, v in json.loads(Config.EXTRA_EVM).items():
+            if not isinstance(v, dict):
+                continue
+            _CHAINS.append(ChainCfg(
+                key=k.lower(), name=v["name"], emoji=v.get("emoji", "⛓️"),
+                type="evm", native=v["native"], poll=v.get("poll", 5),
+                rpc=v["rpc"], explorer=v["explorer"],
+                rpc_fallbacks=tuple(v.get("rpc_fallbacks", [])),
+                chain_id=v.get("chain_id"),
+            ))
+    except Exception as exc:
+        raise RuntimeError("EXTRA_EVM_CHAINS invalid JSON") from exc
+
+# Build lookup maps for O(1) access
+CHAINS_BY_KEY: Dict[str, ChainCfg] = {c.key: c for c in _CHAINS}
+EVM_KEYS: Tuple[str, ...] = tuple(c.key for c in _CHAINS if c.type == "evm")
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 ERC20_ABI = [
@@ -182,970 +188,1397 @@ POPULAR_TZS = [
 ]
 
 # ═══════════════════════════════════════════════════
-# DATABASE
+# BURN DETECTION (O(1) lookup via frozenset)
 # ═══════════════════════════════════════════════════
 
-class Database:
+_BURN_EVM = frozenset(a.lower() for a in {
+    "0x0000000000000000000000000000000000000000",
+    "0x0000000000000000000000000000000000000001",
+    "0x0000000000000000000000000000000000000002",
+    "0x0000000000000000000000000000000000000003",
+    "0x0000000000000000000000000000000000000004",
+    "0x0000000000000000000000000000000000000005",
+    "0x0000000000000000000000000000000000000006",
+    "0x0000000000000000000000000000000000000007",
+    "0x0000000000000000000000000000000000000008",
+    "0x0000000000000000000000000000000000000009",
+    "0x000000000000000000000000000000000000000a",
+    "0x000000000000000000000000000000000000000b",
+    "0x000000000000000000000000000000000000000c",
+    "0x000000000000000000000000000000000000000d",
+    "0x000000000000000000000000000000000000000e",
+    "0x000000000000000000000000000000000000000f",
+    "0x000000000000000000000000000000000000dead",
+    "0x000000000000000000000000000000000000dEaD",
+    "0x000000000000000000000000000000000000DeAd",
+    "0x000000000000000000000000000000000000DEAD",
+    "0x0000000000000000000000000000000000001111",
+    "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
+})
+_BURN_SOL = frozenset(a.lower() for a in {
+    "11111111111111111111111111111111",
+    "So11111111111111111111111111111111111111112",
+    "1nc1nerator11111111111111111111111111111111",
+})
+_BURN_TRON = frozenset(a.lower() for a in {
+    "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",
+    "TNullAddress1111111111111111111111111111111",
+})
+_BURN_BTC = frozenset(a.lower() for a in {
+    "1BitcoinEaterAddressDontSendf59kuE",
+    "1111111111111111111114oLvT2",
+})
+
+_BURN_MAP: Dict[str, frozenset] = {
+    "evm": _BURN_EVM, "sol": _BURN_SOL, "tron": _BURN_TRON, "btc": _BURN_BTC,
+}
+
+def is_burn(chain: str, addr: str) -> bool:
+    return addr.lower().strip() in _BURN_MAP.get(chain, frozenset())
+
+def burn_warn(chain_key: str, addr: str) -> str:
+    cfg = CHAINS_BY_KEY.get(chain_key)
+    name = cfg.name if cfg else chain_key.upper()
+    return (
+        f"⚠️ <b>Burn Address Detected!</b>\n\n"
+        f"<code>{addr}</code>\n\n"
+        f"This is a known burn/dead address on <b>{name}</b>.\n"
+        f"Tokens sent here are permanently lost and cannot be recovered.\n\n"
+        f"❌ <b>This address cannot be monitored.</b>"
+    )
+
+# ═══════════════════════════════════════════════════
+# AUTO-DELETE
+# ═══════════════════════════════════════════════════
+
+async def _schedule_delete(bot: Bot, chat: int, umsg: int, bmsg: int, delay: int):
+    await asyncio.sleep(delay)
+    for mid in (umsg, bmsg):
+        try:
+            await bot.delete_message(chat, mid)
+        except Exception:
+            pass
+
+async def _telegram_call(factory, attempts: int = 3):
+    """Run a Telegram request with bounded retries for transient network errors."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await factory()
+        except TelegramRetryAfter as exc:
+            if attempt == attempts:
+                logger.warning("Telegram rate limit persisted after %d attempts", attempts)
+                return None
+            await asyncio.sleep(exc.retry_after)
+        except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError) as exc:
+            if attempt == attempts:
+                logger.warning("Telegram request failed after %d attempts: %s", attempts, exc)
+                return None
+            await asyncio.sleep(min(2 ** attempt, 8))
+
+
+async def reply_del(msg: types.Message, text: str, delay: int = Config.AUTO_DELETE, **kw) -> Optional[types.Message]:
+    reply = await _telegram_call(lambda: msg.answer(text, **kw))
+    if reply is None:
+        return None
+    asyncio.create_task(_schedule_delete(msg.bot, msg.chat.id, msg.message_id, reply.message_id, delay))
+    return reply
+
+# ═══════════════════════════════════════════════════
+# DATABASE (optimized with WAL mode, batch ops)
+# ═══════════════════════════════════════════════════
+
+class DB:
     def __init__(self, path: str):
-        self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.lock = asyncio.Lock()
+        self._path = path
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        self._lock = asyncio.Lock()
         self._init()
 
     def _init(self):
-        cur = self.conn.cursor()
-        cur.executescript(
-            """
+        cur = self._conn.cursor()
+        cur.executescript("""
             CREATE TABLE IF NOT EXISTS users (
-                chat_id INTEGER PRIMARY KEY,
-                username TEXT, first_name TEXT,
-                timezone TEXT DEFAULT 'UTC',
-                notifications_enabled INTEGER DEFAULT 1,
+                chat_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+                timezone TEXT DEFAULT 'UTC', notifications_enabled INTEGER DEFAULT 1,
+                is_admin INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS addresses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                address TEXT NOT NULL,
-                chain TEXT DEFAULT 'evm',
-                label TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                address TEXT NOT NULL COLLATE NOCASE, chain TEXT DEFAULT 'evm',
+                label TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS chain_state (
-                chain TEXT PRIMARY KEY,
-                last_state TEXT,
+                chain TEXT PRIMARY KEY, last_state TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                chain TEXT NOT NULL,
-                tx_hash TEXT NOT NULL,
-                log_index INTEGER DEFAULT -1,
-                memo TEXT,
-                block_number INTEGER,
-                asset TEXT,
-                amount TEXT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                chain TEXT NOT NULL, tx_hash TEXT NOT NULL, log_index INTEGER DEFAULT -1,
+                memo TEXT, block_number INTEGER, asset TEXT, amount TEXT,
+                direction TEXT DEFAULT 'incoming', notification_timezone TEXT DEFAULT 'UTC',
+                contract_addr TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_addr ON addresses(chat_id, chain);
+            CREATE INDEX IF NOT EXISTS idx_addr_addr ON addresses(address);
             CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(chat_id, created_at);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_notif_unique 
                 ON notifications(chat_id, chain, tx_hash, log_index);
-            """
-        )
-        # Migrate databases created before notification controls existed.
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN notifications_enabled INTEGER DEFAULT 1")
-        except sqlite3.OperationalError:
-            pass
-        self.conn.commit()
+        """)
+        # migrations
+        for col, dtype, tbl in [
+            ("notifications_enabled", "INTEGER DEFAULT 1", "users"),
+            ("is_admin", "INTEGER DEFAULT 0", "users"),
+            ("is_banned", "INTEGER DEFAULT 0", "users"),
+            ("direction", "TEXT DEFAULT 'incoming'", "notifications"),
+            ("notification_timezone", "TEXT DEFAULT 'UTC'", "notifications"),
+            ("contract_addr", "TEXT", "notifications"),
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {dtype}")
+            except sqlite3.OperationalError:
+                pass
+        self._conn.commit()
 
     async def execute(self, sql: str, params: tuple = ()):
-        async with self.lock:
-            return await asyncio.to_thread(lambda: self._exec(sql, params))
+        async with self._lock:
+            return await asyncio.to_thread(self._exec, sql, params)
 
-    def _exec(self, sql, params):
-        cur = self.conn.execute(sql, params)
-        self.conn.commit()
+    def _exec(self, sql: str, params: tuple):
+        cur = self._conn.execute(sql, params)
+        self._conn.commit()
         return cur
 
-    async def fetchall(self, sql: str, params: tuple = ()):
-        async with self.lock:
-            return await asyncio.to_thread(lambda: self.conn.execute(sql, params).fetchall())
+    async def fetchall(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
+        async with self._lock:
+            def _f():
+                return self._conn.execute(sql, params).fetchall()
+            return await asyncio.to_thread(_f)
 
-    async def fetchone(self, sql: str, params: tuple = ()):
-        async with self.lock:
-            return await asyncio.to_thread(lambda: self.conn.execute(sql, params).fetchone())
+    async def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        async with self._lock:
+            def _f():
+                return self._conn.execute(sql, params).fetchone()
+            return await asyncio.to_thread(_f)
 
+    # Batch operations for performance
+    async def batch_insert_notifs(self, rows: List[tuple]):
+        if not rows:
+            return
+        async with self._lock:
+            def _ins():
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO notifications (chat_id,chain,tx_hash,log_index,memo,block_number,asset,amount,direction,notification_timezone,contract_addr) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    rows
+                )
+                self._conn.commit()
+            await asyncio.to_thread(_ins)
+
+    async def get_addresses_by_chain(self, chain: str) -> List[sqlite3.Row]:
+        return await self.fetchall(
+            "SELECT chat_id, address, label FROM addresses WHERE chain=? COLLATE NOCASE",
+            (chain,)
+        )
+
+    async def get_all_evm_addresses(self) -> List[sqlite3.Row]:
+        return await self.fetchall(
+            "SELECT chat_id, address, label FROM addresses WHERE chain='evm'",
+            ()
+        )
+
+    async def get_user_prefs(self, chat_id: int) -> dict:
+        row = await self.fetchone(
+            "SELECT timezone, notifications_enabled, is_admin FROM users WHERE chat_id=?",
+            (chat_id,)
+        )
+        if row:
+            return {"tz": row["timezone"], "enabled": row["notifications_enabled"], "admin": row["is_admin"]}
+        return {"tz": "UTC", "enabled": 1, "admin": 0}
+
+    async def dedup_batch(self, chat_id: int, chain: str, items: List[Tuple[str, int]]) -> Set[Tuple[str, int]]:
+        """Return which (tx_hash, log_index) pairs already exist."""
+        if not items:
+            return set()
+        placeholders = ",".join("(?,?)" for _ in items)
+        params = []
+        for tx, li in items:
+            params.extend([tx, li])
+        rows = await self.fetchall(
+            f"SELECT tx_hash, log_index FROM notifications WHERE chat_id=? AND chain=? AND (tx_hash, log_index) IN ({placeholders})",
+            (chat_id, chain, *params)
+        )
+        return {(r["tx_hash"], r["log_index"]) for r in rows}
 
 # ═══════════════════════════════════════════════════
 # TOKEN CACHES
 # ═══════════════════════════════════════════════════
 
-class EVMTokenCache:
+class EVMCache:
+    __slots__ = ("_cache",)
     def __init__(self):
         self._cache: Dict[str, dict] = {}
 
-    async def get_info(self, w3: AsyncWeb3, token_address: str) -> dict:
-        addr = token_address.lower()
-        if addr in self._cache:
-            return self._cache[addr]
+    async def info(self, w3: AsyncWeb3, addr: str) -> dict:
+        a = addr.lower()
+        if a in self._cache:
+            return self._cache[a]
         try:
-            c = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
-            name = await c.functions.name().call()
-            symbol = await c.functions.symbol().call()
-            decimals = await c.functions.decimals().call()
-            info = {"name": name, "symbol": symbol, "decimals": decimals}
+            c = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=ERC20_ABI)
+            name, sym, dec = await asyncio.gather(
+                c.functions.name().call(),
+                c.functions.symbol().call(),
+                c.functions.decimals().call(),
+            )
+            info = {"name": name, "symbol": sym, "decimals": dec}
         except Exception as exc:
-            logger.warning("Token meta fail %s: %s", token_address, exc)
-            info = {"name": "Unknown Token", "symbol": "???", "decimals": 18}
-        self._cache[addr] = info
+            logger.debug("Token meta fail %s: %s", addr, exc)
+            info = {"name": "Unknown", "symbol": "???", "decimals": 18}
+        self._cache[a] = info
         return info
 
-
-class SPLTokenCache:
+class SPLCache:
+    __slots__ = ("_cache", "_client")
     def __init__(self):
         self._cache: Dict[str, dict] = {}
-        self.client: Optional[httpx.AsyncClient] = None
+        self._client: Optional[httpx.AsyncClient] = None
 
-    async def get_info(self, mint: str) -> dict:
+    async def info(self, mint: str) -> dict:
         if mint in self._cache:
             return self._cache[mint]
-        if not self.client:
-            self.client = httpx.AsyncClient(timeout=10)
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=10)
         try:
-            resp = await self.client.get(f"https://tokens.jup.ag/token/{mint}")
-            if resp.status_code == 200:
-                data = resp.json()
-                info = {
-                    "name": data.get("name", "Unknown SPL"),
-                    "symbol": data.get("symbol", f"SPL-{mint[:4]}"),
-                    "decimals": data.get("decimals", 9),
-                }
-            else:
-                info = {"name": "Unknown SPL", "symbol": f"SPL-{mint[:4]}", "decimals": 9}
+            r = await self._client.get(f"https://tokens.jup.ag/token/{mint}")
+            d = r.json() if r.status_code == 200 else {}
+            info = {
+                "name": d.get("name", "Unknown"),
+                "symbol": d.get("symbol", mint[:4]),
+                "decimals": d.get("decimals", 9),
+            }
         except Exception as exc:
-            logger.warning("Jupiter API fail %s: %s", mint, exc)
-            info = {"name": "Unknown SPL", "symbol": f"SPL-{mint[:4]}", "decimals": 9}
+            logger.debug("Jupiter fail %s: %s", mint, exc)
+            info = {"name": "Unknown", "symbol": mint[:4], "decimals": 9}
         self._cache[mint] = info
         return info
 
+    async def close(self):
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
 # ═══════════════════════════════════════════════════
-# TIMEZONE HELPERS
+# TIMEZONE (async, cached)
 # ═══════════════════════════════════════════════════
 
-def get_user_time(db: Database, chat_id: int) -> datetime:
-    row = db.conn.execute("SELECT timezone FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-    tz = row["timezone"] if row and row["timezone"] else "UTC"
-    try:
-        zone = ZoneInfo(tz)
-    except Exception:
-        zone = ZoneInfo("UTC")
-    return datetime.now(zone)
+class TZHelper:
+    __slots__ = ("_db", "_cache", "_ttl")
+    def __init__(self, db: DB):
+        self._db = db
+        self._cache: Dict[int, Tuple[str, float]] = {}
+        self._ttl = Config.USER_CACHE_TTL
 
+    async def get(self, chat_id: int) -> str:
+        now = time.monotonic()
+        if chat_id in self._cache:
+            tz, ts = self._cache[chat_id]
+            if now - ts < self._ttl:
+                return tz
+        row = await self._db.fetchone("SELECT timezone FROM users WHERE chat_id=?", (chat_id,))
+        tz = row["timezone"] if row and row["timezone"] else "UTC"
+        self._cache[chat_id] = (tz, now)
+        return tz
 
-def fmt_time(db: Database, chat_id: int, dt: Optional[datetime] = None) -> str:
-    if dt is None:
-        dt = get_user_time(db, chat_id)
-    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    async def now(self, chat_id: int) -> datetime:
+        tz = await self.get(chat_id)
+        try:
+            return datetime.now(ZoneInfo(tz))
+        except Exception:
+            return datetime.now(timezone.utc)
 
+    async def fmt(self, chat_id: int, dt: Optional[datetime] = None, stored_tz: Optional[str] = None) -> str:
+        if dt is None:
+            dt = await self.now(chat_id)
+        elif stored_tz:
+            try:
+                dt = dt.replace(tzinfo=ZoneInfo(stored_tz))
+            except Exception:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    def invalidate(self, chat_id: int):
+        self._cache.pop(chat_id, None)
+
+# ═══════════════════════════════════════════════════
+# NOTIFICATION BUILDER
+# ═══════════════════════════════════════════════════
+
+class Direction(Enum):
+    IN = "incoming"
+    OUT = "outgoing"
+
+@dataclass
+class Alert:
+    chat_id: int
+    chain_key: str
+    title: str
+    amount_str: str
+    asset: str
+    from_addr: str
+    to_addr: str
+    tx_hash: str
+    direction: Direction
+    memo: Optional[str] = None
+    block: Optional[int] = None
+    wallet_addr: Optional[str] = None
+    log_index: int = -1
+    contract_addr: Optional[str] = None
+
+class Notifier:
+    __slots__ = ("_db", "_tz", "_bot", "_user_cache")
+    def __init__(self, db: DB, tz: TZHelper, bot: Bot):
+        self._db = db
+        self._tz = tz
+        self._bot = bot
+        self._user_cache: Dict[int, dict] = {}
+
+    async def _pref(self, chat_id: int) -> dict:
+        now = time.monotonic()
+        if chat_id in self._user_cache:
+            pref, ts = self._user_cache[chat_id]
+            if now - ts < Config.USER_CACHE_TTL:
+                return pref
+        pref = await self._db.get_user_prefs(chat_id)
+        self._user_cache[chat_id] = (pref, now)
+        return pref
+
+    async def send(self, alert: Alert) -> bool:
+        pref = await self._pref(alert.chat_id)
+        if not pref.get("enabled", 1):
+            return True
+        cfg = CHAINS_BY_KEY[alert.chain_key]
+        label = "My Wallet"
+        if alert.wallet_addr:
+            row = await self._db.fetchone(
+                "SELECT label FROM addresses WHERE chat_id=? AND chain=? AND address=? COLLATE NOCASE",
+                (alert.chat_id, "evm" if cfg.type == "evm" else alert.chain_key, alert.wallet_addr.lower())
+            )
+            if row and row["label"]:
+                label = row["label"]
+
+        d = alert.direction
+        badge = "🟢 IN" if d == Direction.IN else "🔴 OUT"
+        de = "📥" if d == Direction.IN else "📤"
+        oe = "📤" if d == Direction.IN else "📥"
+        ol = "From" if d == Direction.IN else "To"
+        sl = "To" if d == Direction.IN else "From"
+        tstr = await self._tz.fmt(alert.chat_id)
+        watched_addr = alert.wallet_addr or (alert.to_addr if d == Direction.IN else alert.from_addr)
+
+        text = (
+            f"<b>{badge} {alert.title}</b>\n\n"
+            f"<b>{cfg.emoji} {cfg.name}</b>\n"
+            f"<b>Wallet:</b> <code>{watched_addr}</code> <i>({label})</i>\n"
+            f"<b>💰 Amount:</b> <code>{alert.amount_str} {alert.asset}</code>\n"
+            f"<b>{oe} {ol}:</b> <code>{alert.from_addr}</code>\n"
+            f"<b>{de} {sl}:</b> <code>{alert.to_addr}</code> <i>({label})</i>\n"
+        )
+        if alert.contract_addr:
+            text += f"<b>Token contract:</b> <code>{alert.contract_addr}</code>\n"
+        if alert.memo:
+            text += f"<b>📝 Memo:</b> <code>{alert.memo}</code>\n"
+        if alert.block is not None:
+            text += f"<b>📦 Block:</b> <code>{alert.block}</code>\n"
+        text += (
+            f"<b>🔗 Tx:</b> <a href='{cfg.explorer}{alert.tx_hash}'>{alert.tx_hash}</a>\n"
+            f"<b>⏰ Time:</b> <code>{tstr}</code>"
+        )
+
+        for attempt in range(1, 4):
+            try:
+                await self._bot.send_message(alert.chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                return True
+            except Exception as exc:
+                if attempt == 3:
+                    logger.error("Notify fail %s: %s", alert.chat_id, exc)
+                else:
+                    await asyncio.sleep(attempt * 1.5)
+        return False
+
+    async def mark(self, alerts: List[Alert]):
+        if not alerts:
+            return
+        rows = []
+        for a in alerts:
+            tz = await self._tz.get(a.chat_id)
+            rows.append((a.chat_id, a.chain_key, a.tx_hash, a.log_index, a.memo, a.block, a.asset, a.amount_str, a.direction.value, tz, a.contract_addr))
+        await self._db.batch_insert_notifs(rows)
 
 # ═══════════════════════════════════════════════════
 # BASE MONITOR
 # ═══════════════════════════════════════════════════
 
-class BaseMonitor(ABC):
-    def __init__(self, key: str, cfg: dict, db: Database, bot: Bot):
+async def _close_web3(w3: Optional[AsyncWeb3]):
+    """Close a Web3 HTTP provider and its aiohttp session cache."""
+    if w3 is None:
+        return
+    provider = getattr(w3, "provider", None)
+    disconnect = getattr(provider, "disconnect", None)
+    if callable(disconnect):
+        try:
+            result = disconnect()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.debug("Web3 provider close failed: %s", exc)
+
+class Monitor(ABC):
+    __slots__ = ("key", "cfg", "db", "notifier", "running")
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier):
         self.key = key
         self.cfg = cfg
         self.db = db
-        self.bot = bot
+        self.notifier = notifier
         self.running = False
 
     @abstractmethod
-    async def start(self): ...
+    async def run(self): ...
 
     async def stop(self):
         self.running = False
+        client = getattr(self, "_client", None)
+        if client is not None:
+            await client.aclose()
+            self._client = None
 
-    async def _notify(self, chat_id: int, title: str, icon: str, amount_str: str,
-                      asset: str, from_addr: str, to_addr: str, tx_hash: str,
-                      memo: Optional[str] = None, extra: Optional[str] = None,
-                      asset_raw: Optional[str] = None, amount_raw: Optional[str] = None,
-                      wallet_address: Optional[str] = None, block: Optional[int] = None):
-        preference = await self.db.fetchone(
-            "SELECT notifications_enabled FROM users WHERE chat_id=?", (chat_id,)
-        )
-        if preference and preference["notifications_enabled"] == 0:
-            return
-        address_chain = "evm" if self.cfg.get("type") == "evm" else self.key
-        label_row = await self.db.fetchone(
-            "SELECT label FROM addresses WHERE chat_id=? AND chain=? AND LOWER(address)=?",
-            (chat_id, address_chain, (wallet_address or to_addr).lower()),
-        )
-        label = label_row["label"] if label_row and label_row["label"] else "My Wallet"
-
-        # Full values make alerts directly copyable for wallet and explorer checks.
-        f_short = from_addr
-        t_short = to_addr
-        tx_short = tx_hash
-        time_str = fmt_time(self.db, chat_id)
-
-        text = (
-            f"<b>{icon} {title}</b>\n\n"
-            f"<b>{self.cfg['emoji']} {self.cfg['name']}</b>\n"
-            f"<b>💰 Amount:</b> <code>{amount_str} {asset}</code>\n"
-            f"<b>📤 From:</b> <code>{f_short}</code>\n"
-            f"<b>📥 To:</b> <code>{t_short}</code> <i>({label})</i>\n"
-        )
-        if memo:
-            text += f"<b>📝 Memo:</b> <code>{memo}</code>\n"
-        if extra:
-            text += f"{extra}\n"
-        if block is not None:
-            text += f"<b>📦 Block:</b> <code>{block}</code>\n"
-        text += (
-            f"<b>🔗 Tx:</b> <a href='{self.cfg['explorer']}{tx_hash}'>{tx_short}</a>\n"
-            f"<b>⏰ Time:</b> <code>{time_str}</code>"
-        )
-
-        for attempt in range(1, 4):
-            try:
-                await self.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                return
-            except Exception as exc:
-                if attempt == 3:
-                    logger.error("Notify failed to %s after 3 attempts: %s", chat_id, exc)
-                else:
-                    logger.warning("Notify attempt %d failed to %s: %s", attempt, chat_id, exc)
-                    await asyncio.sleep(attempt * 1.5)
-
-    async def _dedup(self, chat_id: int, tx_hash: str, log_index: int = -1) -> bool:
-        row = await self.db.fetchone(
-            "SELECT 1 FROM notifications WHERE chat_id=? AND chain=? AND tx_hash=? AND log_index=?",
-            (chat_id, self.key, tx_hash, log_index),
-        )
-        return row is not None
-
-    async def _mark(self, chat_id: int, tx_hash: str, log_index: int = -1,
-                    memo: Optional[str] = None, block: Optional[int] = None,
-                    asset: Optional[str] = None, amount: Optional[str] = None):
-        await self.db.execute(
-            "INSERT INTO notifications (chat_id,chain,tx_hash,log_index,memo,block_number,asset,amount) VALUES (?,?,?,?,?,?,?,?)",
-            (chat_id, self.key, tx_hash, log_index, memo, block, asset, amount),
-        )
-
+        w3 = getattr(self, "_w3", None)
+        if w3 is not None:
+            await _close_web3(w3)
+            self._w3 = None
 
 # ═══════════════════════════════════════════════════
-# EVM MONITOR
+# EVM MONITOR (optimized: batch dedup, concurrent)
 # ═══════════════════════════════════════════════════
 
-class EVMMonitor(BaseMonitor):
-    def __init__(self, key: str, cfg: dict, db: Database, bot: Bot, cache: EVMTokenCache):
-        super().__init__(key, cfg, db, bot)
-        self.cache = cache
-        self.w3: Optional[AsyncWeb3] = None
-        self.rpc_url: Optional[str] = None
+class EVMMonitor(Monitor):
+    __slots__ = ("_cache", "_w3", "_rpc_url", "_rpc_failures")
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier, cache: EVMCache):
+        super().__init__(key, cfg, db, notifier)
+        self._cache = cache
+        self._w3: Optional[AsyncWeb3] = None
+        self._rpc_url: Optional[str] = None
+        self._rpc_failures = 0
 
     async def _connect(self) -> bool:
-        endpoints = [self.cfg["rpc"], *self.cfg.get("rpc_fallbacks", [])]
-        for endpoint in dict.fromkeys(endpoints):
-            provider = AsyncHTTPProvider(endpoint)
+        endpoints = (self.cfg.rpc, *self.cfg.rpc_fallbacks)
+        for ep in dict.fromkeys(endpoints):
+            if not ep:
+                continue
+            provider = AsyncHTTPProvider(ep)
             candidate = AsyncWeb3(provider)
-            # Polygon, BSC, and several sidechains include consensus metadata
-            # in extraData, which needs the POA compatibility middleware.
             candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             try:
                 if await candidate.is_connected():
-                    self.w3 = candidate
-                    self.rpc_url = endpoint
-                    logger.info("▶️  EVM %s connected via %s", self.cfg["name"], endpoint)
+                    self._w3 = candidate
+                    self._rpc_url = ep
+                    self._rpc_failures = 0
                     return True
             except Exception as exc:
-                logger.warning("%s RPC failed (%s): %s", self.cfg["name"], endpoint, exc)
-        self.w3 = None
-        self.rpc_url = None
+                logger.debug("%s RPC fail %s: %s", self.cfg.name, ep, exc)
+            finally:
+                if self._w3 is not candidate:
+                    await _close_web3(candidate)
+        self._w3 = None
         return False
 
-    async def start(self):
-        # web3.py 6/7 exposes the asynchronous transport as AsyncHTTPProvider.
+    async def run(self):
         self.running = True
-        logger.info("▶️  EVM %s started (poll %ss)", self.cfg["name"], self.cfg["poll"])
         while self.running:
-            if self.w3 is None:
-                if not await self._connect():
-                    logger.error("❌ %s RPC unavailable (all endpoints failed); retrying in 30s", self.cfg["name"])
-                    await asyncio.sleep(30)
-                    continue
+            if self._w3 is None and not await self._connect():
+                self._rpc_failures += 1
+                if self._rpc_failures == 1 or self._rpc_failures % 10 == 0:
+                    delay = min(30 * (2 ** min(self._rpc_failures - 1, 3)), 300)
+                    logger.error("❌ %s all RPC down, retry in %ss", self.cfg.name, delay)
+                else:
+                    delay = min(30 * (2 ** min(self._rpc_failures - 1, 3)), 300)
+                await asyncio.sleep(delay)
+                continue
             try:
                 await self._tick()
             except Exception as exc:
-                logger.warning("%s tick failed on %s: %s; trying RPC failover", self.key, self.rpc_url, exc)
-                self.w3 = None
+                logger.warning("%s tick err: %s", self.key, exc)
+                await _close_web3(self._w3)
+                self._w3 = None
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        current = await self.w3.eth.block_number
+        current = await self._w3.eth.block_number
         row = await self.db.fetchone("SELECT last_state FROM chain_state WHERE chain=?", (self.key,))
         last = int(row["last_state"]) if row and row["last_state"] else current - 1
         if current <= last:
-            await asyncio.sleep(self.cfg["poll"])
+            await asyncio.sleep(self.cfg.poll)
             return
-        from_block = last + 1
-        to_block = min(current, from_block + 9)
-        rows = await self.db.fetchall("SELECT DISTINCT address FROM addresses WHERE chain='evm'")
-        if not rows:
-            await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (self.key, str(to_block)))
-            await asyncio.sleep(self.cfg["poll"])
+        fblock, tblock = last + 1, min(current, last + 10)
+        addrs = await self.db.get_all_evm_addresses()
+        if not addrs:
+            await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (self.key, str(tblock)))
+            await asyncio.sleep(self.cfg.poll)
             return
-        addrs = [r["address"].lower() for r in rows]
-        addr_set = set(addrs)
-        await self._scan_erc20(from_block, to_block, addr_set)
-        await self._scan_native(from_block, to_block, addr_set)
-        await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (self.key, str(to_block)))
-        await asyncio.sleep(self.cfg["poll"])
 
-    async def _scan_erc20(self, f: int, t: int, addr_set: set):
-        try:
-            logs = await self.w3.eth.get_logs({"fromBlock": f, "toBlock": t, "topics": [TRANSFER_TOPIC]})
-        except Exception as exc:
-            # RPC providers commonly cap the number of logs per request.
-            # Split the range and retry so busy chains remain monitorable.
-            if t > f:
-                middle = (f + t) // 2
-                await self._scan_erc20(f, middle, addr_set)
-                await self._scan_erc20(middle + 1, t, addr_set)
-                return
-            logger.warning("%s logs err: %s", self.key, exc)
+        addr_set = {r["address"].lower(): r for r in addrs}
+        delivered = await asyncio.gather(
+            self._scan_erc20(fblock, tblock, addr_set),
+            self._scan_native(fblock, tblock, addr_set),
+        )
+        if not all(delivered):
+            # Do not move the cursor when Telegram delivery failed. The same
+            # block range will be retried on the next poll.
+            await asyncio.sleep(5)
             return
+        await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (self.key, str(tblock)))
+        await asyncio.sleep(self.cfg.poll)
+
+    async def _scan_erc20(self, f: int, t: int, addr_map: Dict[str, sqlite3.Row]) -> bool:
+        try:
+            logs = await self._w3.eth.get_logs({"fromBlock": f, "toBlock": t, "topics": [TRANSFER_TOPIC]})
+        except Exception as exc:
+            if t > f:
+                m = (f + t) // 2
+                results = await asyncio.gather(
+                    self._scan_erc20(f, m, addr_map),
+                    self._scan_erc20(m + 1, t, addr_map),
+                )
+                return all(results)
+            raise
+
+        # Group by tx_hash for batch dedup
+        tx_items: Dict[str, List[dict]] = defaultdict(list)
         for log in logs:
             if len(log["topics"]) < 3:
                 continue
-            to_raw = log["topics"][2].hex()
-            to_addr = "0x" + to_raw[-40:]
-            from_raw = log["topics"][1].hex()
-            from_addr = "0x" + from_raw[-40:]
-            from_watched = from_addr.lower() in addr_set
-            to_watched = to_addr.lower() in addr_set
-            if not from_watched and not to_watched:
+            fr = "0x" + log["topics"][1].hex()[-40:]
+            to = "0x" + log["topics"][2].hex()[-40:]
+            fr_w = fr.lower() in addr_map
+            to_w = to.lower() in addr_map
+            if not fr_w and not to_w:
                 continue
-            direction = "outgoing" if from_watched else "incoming"
-            watched_addr = from_addr if from_watched else to_addr
             data = log["data"].hex() if isinstance(log["data"], bytes) else log["data"]
-            amount = int(data, 16)
-            token_addr = log["address"]
             tx_hash = log["transactionHash"].hex()
-            li = log["logIndex"]
-            block = log["blockNumber"]
-            users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='evm' AND LOWER(address)=?", (watched_addr.lower(),))
-            for u in users:
-                cid = u["chat_id"]
-                try:
-                    if await self._dedup(cid, tx_hash, li):
-                        continue
-                    info = await self.cache.get_info(self.w3, token_addr)
-                    amt = Decimal(amount) / Decimal(10 ** info["decimals"])
-                    amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                    asset_name = f"{info['name']} ({info['symbol']})"
-                    if direction == "outgoing":
-                        asset_name = f"Sent {asset_name}"
-                    alert_title = "Outgoing ERC-20 Token" if direction == "outgoing" else "Incoming ERC-20 Token"
-                    alert_icon = "🟠" if direction == "outgoing" else "🟢"
-                    await self._notify(cid, alert_title, alert_icon, amt_str, asset_name,
-                                       from_addr, to_addr, tx_hash, block=block,
-                                       wallet_address=watched_addr)
-                    await self._mark(cid, tx_hash, li, block=block, asset=asset_name, amount=amt_str)
-                except Exception as exc:
-                    # A single bad notification must never block state advancement
-                    # for the rest of the batch (that's what caused this bug).
-                    logger.error("%s ERC-20 notify failed for tx %s (chat %s): %s", self.key, tx_hash, cid, exc)
+            tx_items[tx_hash].append({
+                "fr": fr, "to": to, "fr_w": fr_w, "to_w": to_w,
+                "amount": int(data, 16), "token": log["address"],
+                "li": log["logIndex"], "block": log["blockNumber"],
+            })
 
-    async def _scan_native(self, f: int, t: int, addr_set: set):
+        alerts: List[Alert] = []
+        for tx_hash, items in tx_items.items():
+            for item in items:
+                directions = []
+                if item["fr_w"]:
+                    directions.append((Direction.OUT, item["fr"], item["li"]))
+                if item["to_w"] and not item["fr_w"]:
+                    directions.append((Direction.IN, item["to"], item["li"] + 100000))
+                elif item["to_w"] and item["fr_w"]:
+                    directions.append((Direction.IN, item["to"], item["li"] + 100000))
+
+                for direction, watched, dedup_li in directions:
+                    chat_id = addr_map[watched.lower()]["chat_id"]
+                    info = await self._cache.info(self._w3, item["token"])
+                    amt = Decimal(item["amount"]) / Decimal(10 ** info["decimals"])
+                    amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
+                    asset = f"{info['name']} ({info['symbol']})"
+                    title = "Outgoing ERC-20" if direction == Direction.OUT else "Incoming ERC-20"
+                    alerts.append(Alert(
+                        chat_id=chat_id, chain_key=self.key, title=title,
+                        amount_str=amt_str, asset=asset, from_addr=item["fr"], to_addr=item["to"],
+                        tx_hash=tx_hash, direction=direction, block=item["block"], wallet_addr=watched,
+                        log_index=dedup_li,
+                        contract_addr=item["token"],
+                    ))
+
+        return await self._send_batch(alerts)
+
+    async def _scan_native(self, f: int, t: int, addr_map: Dict[str, sqlite3.Row]) -> bool:
+        alerts: List[Alert] = []
         for n in range(f, t + 1):
             try:
-                block = await self.w3.eth.get_block(n, full_transactions=True)
-            except Exception as exc:
-                logger.warning("%s block %d err: %s", self.key, n, exc)
-                continue
-            for tx in block.transactions:
+                blk = await self._w3.eth.get_block(n, full_transactions=True)
+            except Exception:
+                raise
+            for tx in blk.transactions:
                 to = tx.get("to")
-                from_addr = tx.get("from")
-                if not to or not from_addr or tx.get("value", 0) == 0:
+                fr = tx.get("from")
+                if not to or not fr or tx.get("value", 0) == 0:
                     continue
-                from_watched = from_addr.lower() in addr_set
-                to_watched = to.lower() in addr_set
-                if not from_watched and not to_watched:
+                fr_w = fr.lower() in addr_map
+                to_w = to.lower() in addr_map
+                if not fr_w and not to_w:
                     continue
-                direction = "outgoing" if from_watched else "incoming"
-                watched_addr = from_addr if from_watched else to
-                tx_hash = tx["hash"].hex()
-                users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='evm' AND LOWER(address)=?", (watched_addr.lower(),))
-                for u in users:
-                    cid = u["chat_id"]
-                    try:
-                        if await self._dedup(cid, tx_hash, -1):
-                            continue
-                        amt = Decimal(tx["value"]) / Decimal(10 ** 18)
-                        amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                        if direction == "outgoing":
-                            amt_str = f"- {amt_str}"
-                        alert_title = "Outgoing Native Transfer" if direction == "outgoing" else "Incoming Native Transfer"
-                        alert_icon = "🟠" if direction == "outgoing" else "⬇️"
-                        await self._notify(cid, alert_title, alert_icon, amt_str, self.cfg["native"],
-                                           from_addr, to, tx_hash, block=n,
-                                           wallet_address=watched_addr)
-                        await self._mark(cid, tx_hash, -1, block=n, asset=self.cfg["native"], amount=amt_str)
-                    except Exception as exc:
-                        # A single bad notification must never block state advancement
-                        # for the rest of the batch (that's what caused this bug).
-                        logger.error("%s native notify failed for tx %s (chat %s): %s", self.key, tx_hash, cid, exc)
+                txh = tx["hash"].hex()
+                directions = []
+                if fr_w:
+                    directions.append((Direction.OUT, fr, -1))
+                if to_w and not fr_w:
+                    directions.append((Direction.IN, to, -2))
+                elif to_w and fr_w:
+                    directions.append((Direction.IN, to, -2))
+                for direction, watched, dli in directions:
+                    chat_id = addr_map[watched.lower()]["chat_id"]
+                    amt = Decimal(tx["value"]) / Decimal(10 ** 18)
+                    amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
+                    title = "Outgoing Native" if direction == Direction.OUT else "Incoming Native"
+                    alerts.append(Alert(
+                        chat_id=chat_id, chain_key=self.key, title=title,
+                        amount_str=amt_str, asset=self.cfg.native, from_addr=fr, to_addr=to,
+                        tx_hash=txh, direction=direction, block=n, wallet_addr=watched,
+                        log_index=dli,
+                    ))
+        return await self._send_batch(alerts)
 
+    async def _send_batch(self, alerts: List[Alert]) -> bool:
+        if not alerts:
+            return True
+        # Dedup check
+        by_chat: Dict[int, List[Alert]] = defaultdict(list)
+        for a in alerts:
+            by_chat[a.chat_id].append(a)
+        final: List[Alert] = []
+        for chat_id, als in by_chat.items():
+            items = [(a.tx_hash, a.log_index) for a in als]
+            existing = await self.db.dedup_batch(chat_id, self.key, items)
+            for a in als:
+                if (a.tx_hash, a.log_index) not in existing:
+                    final.append(a)
+        if not final:
+            return True
+        delivered = await asyncio.gather(*(self.notifier.send(a) for a in final))
+        await self.notifier.mark([a for a, ok in zip(final, delivered) if ok])
+        return all(delivered)
 
 # ═══════════════════════════════════════════════════
-# TON MONITOR (Native + All Jettons)
+# TON MONITOR
 # ═══════════════════════════════════════════════════
 
-class TONMonitor(BaseMonitor):
-    async def start(self):
-        self.client = httpx.AsyncClient(timeout=30)
+class TONMonitor(Monitor):
+    __slots__ = ("_client",)
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier):
+        super().__init__(key, cfg, db, notifier)
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def run(self):
+        self._client = httpx.AsyncClient(timeout=30)
         self.running = True
-        logger.info("▶️  TON started (poll %ss)", self.cfg["poll"])
+        headers = {"Authorization": f"Bearer {Config.TON_API_KEY}"} if Config.TON_API_KEY else {}
         while self.running:
             try:
-                await self._tick()
+                await self._tick(headers)
             except Exception as exc:
-                logger.exception("TON tick: %s", exc)
+                logger.exception("TON: %s", exc)
                 await asyncio.sleep(5)
 
-    async def _tick(self):
-        rows = await self.db.fetchall("SELECT DISTINCT address FROM addresses WHERE chain='ton'")
+    async def _tick(self, headers: dict):
+        rows = await self.db.get_addresses_by_chain("ton")
         if not rows:
-            await asyncio.sleep(self.cfg["poll"])
+            await asyncio.sleep(self.cfg.poll)
             return
-        headers = {}
-        if TON_API_KEY:
-            headers["Authorization"] = f"Bearer {TON_API_KEY}"
+        alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
             try:
-                resp = await self.client.get(f"https://tonapi.io/v2/accounts/{addr}/events", params={"limit": 20}, headers=headers)
+                resp = await self._client.get(f"{self.cfg.api}/accounts/{addr}/events", params={"limit": 20}, headers=headers)
                 data = resp.json()
             except Exception as exc:
-                logger.warning("TonAPI err for %s: %s", addr, exc)
+                logger.debug("TON API %s: %s", addr, exc)
                 continue
-            if not data.get("events"):
-                continue
-            for event in data.get("events", []):
-                event_id = event.get("event_id")
-                if not event_id:
+            for event_index, event in enumerate(data.get("events", [])):
+                eid = event.get("event_id")
+                if not eid:
                     continue
-                for action in event.get("actions", []):
-                    act_type = action.get("type")
-                    if act_type == "TonTransfer":
-                        ton_tx = action.get("TonTransfer", {})
-                        rcpt = ton_tx.get("recipient", {}).get("address", {}).get("address")
-                        if rcpt != addr:
+                for action_index, action in enumerate(event.get("actions", [])):
+                    atype = action.get("type")
+                    if atype == "TonTransfer":
+                        t = action.get("TonTransfer", {})
+                        rcpt = t.get("recipient", {}).get("address", {}).get("address")
+                        sender = t.get("sender", {}).get("address", {}).get("address", "?")
+                        amt = int(t.get("amount", 0))
+                        if amt == 0:
                             continue
-                        amount = int(ton_tx.get("amount", 0))
-                        if amount == 0:
+                        direction = Direction.IN if rcpt == addr else (Direction.OUT if sender == addr else None)
+                        if direction is None:
                             continue
-                        sender = ton_tx.get("sender", {}).get("address", {}).get("address", "?")
-                        memo = ton_tx.get("comment")
-                        users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='ton' AND address=?", (addr,))
-                        for u in users:
-                            cid = u["chat_id"]
-                            if await self._dedup(cid, event_id):
-                                continue
-                            amt = Decimal(amount) / Decimal(10 ** self.cfg["decimals"])
-                            amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                            await self._notify(cid, "Incoming TON Transfer", "⬇️", amt_str, self.cfg["native"],
-                                               sender, addr, event_id, memo=memo)
-                            await self._mark(cid, event_id, memo=memo, asset=self.cfg["native"], amount=amt_str)
-                    elif act_type == "JettonTransfer":
-                        jet_tx = action.get("JettonTransfer", {})
-                        rcpt = jet_tx.get("recipient", {}).get("address", {}).get("address")
-                        if rcpt != addr:
+                        a = Decimal(amt) / Decimal(10 ** self.cfg.decimals)
+                        alerts.append(Alert(
+                            chat_id=r["chat_id"], chain_key=self.key,
+                            title="Outgoing TON" if direction == Direction.OUT else "Incoming TON",
+                            amount_str=f"{a:,.6f}".rstrip("0").rstrip("."),
+                            asset=self.cfg.native,
+                            from_addr=addr if direction == Direction.OUT else sender,
+                            to_addr=rcpt if direction == Direction.OUT else addr,
+                            tx_hash=eid, direction=direction, memo=t.get("comment"),
+                            log_index=event_index * 1000 + action_index,
+                        ))
+                    elif atype == "JettonTransfer":
+                        t = action.get("JettonTransfer", {})
+                        rcpt = t.get("recipient", {}).get("address", {}).get("address")
+                        sender = t.get("sender", {}).get("address", {}).get("address", "?")
+                        amt_s = t.get("amount", "0")
+                        if amt_s == "0" or not amt_s:
                             continue
-                        amount_str = jet_tx.get("amount", "0")
-                        if amount_str == "0" or not amount_str:
+                        direction = Direction.IN if rcpt == addr else (Direction.OUT if sender == addr else None)
+                        if direction is None:
                             continue
-                        jetton = jet_tx.get("jetton", {})
-                        token_name = jetton.get("name", "Unknown Jetton")
-                        token_symbol = jetton.get("symbol", "???")
-                        decimals = jetton.get("decimals", 9)
-                        sender = jet_tx.get("sender", {}).get("address", {}).get("address", "?")
-                        memo = jet_tx.get("comment")
-                        users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='ton' AND address=?", (addr,))
-                        for u in users:
-                            cid = u["chat_id"]
-                            if await self._dedup(cid, event_id):
-                                continue
-                            amt = Decimal(amount_str) / Decimal(10 ** decimals)
-                            amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                            asset_name = f"{token_name} ({token_symbol})"
-                            await self._notify(cid, "Incoming Jetton Token", "🟢", amt_str, asset_name,
-                                               sender, addr, event_id, memo=memo)
-                            await self._mark(cid, event_id, memo=memo, asset=asset_name, amount=amt_str)
-        await asyncio.sleep(self.cfg["poll"])
+                        jet = t.get("jetton", {})
+                        dec = jet.get("decimals", 9)
+                        a = Decimal(amt_s) / Decimal(10 ** dec)
+                        alerts.append(Alert(
+                            chat_id=r["chat_id"], chain_key=self.key,
+                            title="Outgoing Jetton" if direction == Direction.OUT else "Incoming Jetton",
+                            amount_str=f"{a:,.6f}".rstrip("0").rstrip("."),
+                            asset=f"{jet.get('name', 'Unknown')} ({jet.get('symbol', '???')})",
+                            from_addr=addr if direction == Direction.OUT else sender,
+                            to_addr=rcpt if direction == Direction.OUT else addr,
+                            tx_hash=eid,
+                            direction=direction, memo=t.get("comment"),
+                            log_index=event_index * 1000 + action_index,
+                            contract_addr=jet.get("address") or jet.get("master"),
+                        ))
+        await self._send_batch(alerts)
+        await asyncio.sleep(self.cfg.poll)
 
+    async def _send_batch(self, alerts: List[Alert]):
+        if not alerts:
+            return
+        by_chat = defaultdict(list)
+        for a in alerts:
+            by_chat[a.chat_id].append(a)
+        final = []
+        for cid, als in by_chat.items():
+            items = [(a.tx_hash, a.log_index) for a in als]
+            existing = await self.db.dedup_batch(cid, self.key, items)
+            for a in als:
+                if (a.tx_hash, a.log_index) not in existing:
+                    final.append(a)
+        if final:
+            delivered = await asyncio.gather(*(self.notifier.send(a) for a in final))
+            await self.notifier.mark([a for a, ok in zip(final, delivered) if ok])
 
 # ═══════════════════════════════════════════════════
-# XLM MONITOR (Native + All Assets)
+# XLM MONITOR
 # ═══════════════════════════════════════════════════
 
-class XLMMonitor(BaseMonitor):
-    async def start(self):
-        self.client = httpx.AsyncClient(timeout=30)
+class XLMMonitor(Monitor):
+    __slots__ = ("_client",)
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier):
+        super().__init__(key, cfg, db, notifier)
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def run(self):
+        self._client = httpx.AsyncClient(timeout=30)
         self.running = True
-        logger.info("▶️  XLM started (poll %ss)", self.cfg["poll"])
         while self.running:
             try:
                 await self._tick()
             except Exception as exc:
-                logger.exception("XLM tick: %s", exc)
+                logger.exception("XLM: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        rows = await self.db.fetchall("SELECT DISTINCT address FROM addresses WHERE chain='xlm'")
+        rows = await self.db.get_addresses_by_chain("xlm")
         if not rows:
-            await asyncio.sleep(self.cfg["poll"])
+            await asyncio.sleep(self.cfg.poll)
             return
+        alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
             cursor = None
-            state_row = await self.db.fetchone("SELECT last_state FROM chain_state WHERE chain=?", (f"xlm_{addr}",))
-            if state_row and state_row["last_state"]:
-                cursor = state_row["last_state"]
+            st = await self.db.fetchone("SELECT last_state FROM chain_state WHERE chain=?", (f"xlm_{addr}",))
+            if st and st["last_state"]:
+                cursor = st["last_state"]
             params = {"order": "desc", "limit": 10}
             if cursor:
                 params["cursor"] = cursor
             try:
-                resp = await self.client.get(f"{self.cfg['api']}/accounts/{addr}/payments", params=params)
+                resp = await self._client.get(f"{self.cfg.api}/accounts/{addr}/payments", params=params)
                 data = resp.json()
             except Exception as exc:
-                logger.warning("XLM API err: %s", exc)
+                logger.debug("XLM API: %s", exc)
                 continue
             records = data.get("_embedded", {}).get("records", [])
-            if not records:
-                continue
-            new_cursor = records[0].get("paging_token")
-            if new_cursor:
-                await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (f"xlm_{addr}", new_cursor))
-            for rec in records:
-                if rec.get("to") != addr:
+            for record_index, rec in enumerate(records):
+                txh = rec.get("transaction_hash")
+                if not txh:
                     continue
-                if rec.get("type") not in ("payment", "path_payment"):
-                    continue
-                tx_hash = rec.get("transaction_hash")
-                if not tx_hash:
+                direction = Direction.IN if rec.get("to") == addr else (Direction.OUT if rec.get("from") == addr else None)
+                if direction is None or rec.get("type") not in ("payment", "path_payment"):
                     continue
                 memo = None
                 try:
-                    tx_resp = await self.client.get(f"{self.cfg['api']}/transactions/{tx_hash}")
-                    tx_data = tx_resp.json()
-                    memo_type = tx_data.get("memo_type")
-                    memo_val = tx_data.get("memo")
-                    if memo_type and memo_val:
-                        memo = f"{memo_type.upper()}: {memo_val}"
+                    td = (await self._client.get(f"{self.cfg.api}/transactions/{txh}")).json()
+                    if td.get("memo_type") and td.get("memo"):
+                        memo = f"{td['memo_type'].upper()}: {td['memo']}"
                 except Exception:
                     pass
-                asset_type = rec.get("asset_type")
-                if asset_type == "native":
+                atype = rec.get("asset_type")
+                if atype == "native":
                     asset = "XLM"
                 else:
                     code = rec.get("asset_code", "ASSET")
                     issuer = rec.get("asset_issuer", "")
-                    issuer_short = f"{issuer[:4]}...{issuer[-4:]}" if issuer else ""
-                    asset = f"{code}" if not issuer_short else f"{code} ({issuer_short})"
-                users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='xlm' AND address=?", (addr,))
-                for u in users:
-                    cid = u["chat_id"]
-                    if await self._dedup(cid, tx_hash):
-                        continue
-                    amt = Decimal(rec.get("amount", "0"))
-                    amt_str = f"{amt:,.7f}".rstrip("0").rstrip(".")
-                    title = "Incoming XLM Payment" if asset == "XLM" else "Incoming Stellar Asset"
-                    icon = "⬇️" if asset == "XLM" else "🟢"
-                    await self._notify(cid, title, icon, amt_str, asset,
-                                       rec.get("from", "?"), addr, tx_hash, memo=memo)
-                    await self._mark(cid, tx_hash, memo=memo, asset=asset, amount=amt_str)
-        await asyncio.sleep(self.cfg["poll"])
+                    asset = f"{code}" + (f" ({issuer[:4]}...{issuer[-4:]})" if issuer else "")
+                amt = Decimal(rec.get("amount", "0"))
+                title = "Outgoing XLM" if direction == Direction.OUT else "Incoming XLM"
+                if asset != "XLM":
+                    title = "Outgoing Asset" if direction == Direction.OUT else "Incoming Asset"
+                alerts.append(Alert(
+                    chat_id=r["chat_id"], chain_key=self.key, title=title,
+                    amount_str=f"{amt:,.7f}".rstrip("0").rstrip("."),
+                    asset=asset, from_addr=rec.get("from", "?"), to_addr=rec.get("to", "?"),
+                    tx_hash=txh, direction=direction, memo=memo, log_index=record_index,
+                    contract_addr=rec.get("asset_issuer") if atype != "native" else None,
+                ))
+            if records:
+                await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (f"xlm_{addr}", records[0].get("paging_token")))
+        await self._send_batch(alerts)
+        await asyncio.sleep(self.cfg.poll)
 
+    async def _send_batch(self, alerts: List[Alert]):
+        if not alerts:
+            return
+        by_chat = defaultdict(list)
+        for a in alerts:
+            by_chat[a.chat_id].append(a)
+        final = []
+        for cid, als in by_chat.items():
+            items = [(a.tx_hash, a.log_index) for a in als]
+            existing = await self.db.dedup_batch(cid, self.key, items)
+            for a in als:
+                if (a.tx_hash, a.log_index) not in existing:
+                    final.append(a)
+        if final:
+            delivered = await asyncio.gather(*(self.notifier.send(a) for a in final))
+            await self.notifier.mark([a for a, ok in zip(final, delivered) if ok])
 
 # ═══════════════════════════════════════════════════
-# SOL MONITOR (Native + All SPL)
+# SOL MONITOR
 # ═══════════════════════════════════════════════════
 
-class SOLMonitor(BaseMonitor):
-    def __init__(self, key: str, cfg: dict, db: Database, bot: Bot, spl_cache: SPLTokenCache):
-        super().__init__(key, cfg, db, bot)
-        self.spl_cache = spl_cache
+class SOLMonitor(Monitor):
+    __slots__ = ("_client", "_spl")
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier, spl: SPLCache):
+        super().__init__(key, cfg, db, notifier)
+        self._client: Optional[httpx.AsyncClient] = None
+        self._spl = spl
 
-    async def start(self):
-        self.client = httpx.AsyncClient(timeout=30)
+    async def run(self):
+        self._client = httpx.AsyncClient(timeout=30)
         self.running = True
-        logger.info("▶️  SOL started (poll %ss)", self.cfg["poll"])
         while self.running:
             try:
                 await self._tick()
             except Exception as exc:
-                logger.exception("SOL tick: %s", exc)
+                logger.exception("SOL: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        rows = await self.db.fetchall("SELECT DISTINCT address FROM addresses WHERE chain='sol'")
+        rows = await self.db.get_addresses_by_chain("sol")
         if not rows:
-            await asyncio.sleep(self.cfg["poll"])
+            await asyncio.sleep(self.cfg.poll)
             return
+        alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
-            before = None
-            state_row = await self.db.fetchone("SELECT last_state FROM chain_state WHERE chain=?", (f"sol_{addr}",))
-            if state_row and state_row["last_state"]:
-                before = state_row["last_state"]
-            payload = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress", "params": [addr, {"limit": 10, "before": before}]}
+            last_signature = None
+            st = await self.db.fetchone("SELECT last_state FROM chain_state WHERE chain=?", (f"sol_{addr}",))
+            if st and st["last_state"]:
+                last_signature = st["last_state"]
+            sig_params = {"limit": 10}
+            if last_signature:
+                # Fetch signatures newer than the last processed signature.
+                sig_params["until"] = last_signature
             try:
-                resp = await self.client.post(self.cfg["rpc"], json=payload)
+                resp = await self._client.post(self.cfg.rpc, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                    "params": [addr, sig_params]
+                })
                 sigs = resp.json().get("result", [])
             except Exception as exc:
-                logger.warning("SOL RPC err: %s", exc)
+                logger.debug("SOL RPC: %s", exc)
                 continue
             if not sigs:
                 continue
-            new_before = sigs[-1].get("signature")
-            await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (f"sol_{addr}", new_before))
-            for sig_info in sigs:
-                sig = sig_info["signature"]
-                tx_payload = {"jsonrpc": "2.0", "id": 1, "method": "getTransaction", "params": [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]}
+            for si in sigs:
+                sig = si["signature"]
                 try:
-                    tx_resp = await self.client.post(self.cfg["rpc"], json=tx_payload)
-                    tx_data = tx_resp.json().get("result")
+                    tx = (await self._client.post(self.cfg.rpc, json={
+                        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                        "params": [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
+                    })).json().get("result")
                 except Exception:
                     continue
-                if not tx_data or tx_data.get("meta", {}).get("err"):
+                if not tx or tx.get("meta", {}).get("err"):
                     continue
-                meta = tx_data.get("meta", {})
-                msg = tx_data.get("transaction", {}).get("message", {})
-                account_keys = msg.get("accountKeys", [])
-                if addr not in account_keys:
+                meta = tx.get("meta", {})
+                msg = tx.get("transaction", {}).get("message", {})
+                keys = msg.get("accountKeys", [])
+                if addr not in keys:
                     continue
-                idx = account_keys.index(addr)
-                memo = None
-                for inst in msg.get("instructions", []):
-                    pidx = inst.get("programIdIndex")
-                    if pidx is not None and pidx < len(account_keys):
-                        prog = account_keys[pidx]
-                        if prog in ("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"):
-                            data = inst.get("data")
-                            if data:
-                                try:
-                                    memo = base64.b64decode(data).decode("utf-8", errors="ignore")
-                                except Exception:
-                                    memo = str(data)
-                users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='sol' AND address=?", (addr,))
+                idx = keys.index(addr)
+                memo = self._extract_memo(msg, keys)
                 pre = meta.get("preBalances", [])[idx] if idx < len(meta.get("preBalances", [])) else 0
                 post = meta.get("postBalances", [])[idx] if idx < len(meta.get("postBalances", [])) else 0
                 diff = post - pre
-                if diff > 0:
-                    for u in users:
-                        cid = u["chat_id"]
-                        if await self._dedup(cid, sig):
-                            continue
-                        amt = Decimal(diff) / Decimal(10 ** self.cfg["decimals"])
-                        amt_str = f"{amt:,.9f}".rstrip("0").rstrip(".")
-                        await self._notify(cid, "Incoming SOL Transfer", "⬇️", amt_str, self.cfg["native"],
-                                           "Network", addr, sig, memo=memo)
-                        await self._mark(cid, sig, memo=memo, asset=self.cfg["native"], amount=amt_str)
-                pre_tokens = {tb["accountIndex"]: tb for tb in meta.get("preTokenBalances", []) if tb.get("owner") == addr}
-                post_tokens = {tb["accountIndex"]: tb for tb in meta.get("postTokenBalances", []) if tb.get("owner") == addr}
-                for tidx in post_tokens:
-                    if tidx not in pre_tokens:
-                        continue
-                    pre_amt = Decimal(pre_tokens[tidx]["uiTokenAmount"]["amount"])
-                    post_amt = Decimal(post_tokens[tidx]["uiTokenAmount"]["amount"])
+                if diff != 0:
+                    direction = Direction.IN if diff > 0 else Direction.OUT
+                    a = Decimal(abs(diff)) / Decimal(10 ** self.cfg.decimals)
+                    alerts.append(Alert(
+                        chat_id=r["chat_id"], chain_key=self.key,
+                        title="Outgoing SOL" if direction == Direction.OUT else "Incoming SOL",
+                        amount_str=f"{a:,.9f}".rstrip("0").rstrip("."),
+                        asset=self.cfg.native,
+                        from_addr=addr if direction == Direction.OUT else "Network",
+                        to_addr="Network" if direction == Direction.OUT else addr,
+                        tx_hash=sig, direction=direction, memo=memo, log_index=0,
+                    ))
+                pre_t = {tb["accountIndex"]: tb for tb in meta.get("preTokenBalances", []) if tb.get("owner") == addr}
+                post_t = {tb["accountIndex"]: tb for tb in meta.get("postTokenBalances", []) if tb.get("owner") == addr}
+                for tidx in set(pre_t) | set(post_t):
+                    pre_amt = Decimal(pre_t.get(tidx, {}).get("uiTokenAmount", {}).get("amount", "0"))
+                    post_amt = Decimal(post_t.get(tidx, {}).get("uiTokenAmount", {}).get("amount", "0"))
                     td = post_amt - pre_amt
-                    if td <= 0:
+                    if td == 0:
                         continue
-                    mint = post_tokens[tidx]["mint"]
-                    decimals = post_tokens[tidx]["uiTokenAmount"]["decimals"]
-                    info = await self.spl_cache.get_info(mint)
-                    sym = info["symbol"]
-                    name = info["name"]
-                    amt_str = f"{td / Decimal(10**decimals):,.6f}".rstrip("0").rstrip(".")
-                    asset_name = f"{name} ({sym})"
-                    for u in users:
-                        cid = u["chat_id"]
-                        if await self._dedup(cid, sig):
-                            continue
-                        await self._notify(cid, "Incoming SPL Token", "🟢", amt_str, asset_name,
-                                           "Network", addr, sig, memo=memo)
-                        await self._mark(cid, sig, memo=memo, asset=asset_name, amount=amt_str)
-        await asyncio.sleep(self.cfg["poll"])
+                    direction = Direction.IN if td > 0 else Direction.OUT
+                    token = post_t.get(tidx) or pre_t[tidx]
+                    mint = token["mint"]
+                    dec = token["uiTokenAmount"]["decimals"]
+                    info = await self._spl.info(mint)
+                    a = abs(td) / Decimal(10 ** dec)
+                    alerts.append(Alert(
+                        chat_id=r["chat_id"], chain_key=self.key,
+                        title="Outgoing SPL" if direction == Direction.OUT else "Incoming SPL",
+                        amount_str=f"{a:,.6f}".rstrip("0").rstrip("."),
+                        asset=f"{info['name']} ({info['symbol']})",
+                        from_addr=addr if direction == Direction.OUT else "Network",
+                        to_addr="Network" if direction == Direction.OUT else addr,
+                        tx_hash=sig, direction=direction, memo=memo, log_index=100000 + tidx,
+                        contract_addr=mint,
+                    ))
+            # Advance only after all fetched transactions were inspected. If an
+            # API call fails, the same signatures are retried on the next poll.
+            await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (f"sol_{addr}", sigs[0].get("signature")))
+        await self._send_batch(alerts)
+        await asyncio.sleep(self.cfg.poll)
 
+    def _extract_memo(self, msg: dict, keys: List[str]) -> Optional[str]:
+        for inst in msg.get("instructions", []):
+            pidx = inst.get("programIdIndex")
+            if pidx is not None and pidx < len(keys):
+                prog = keys[pidx]
+                if prog in ("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"):
+                    data = inst.get("data")
+                    if data:
+                        try:
+                            return base64.b64decode(data).decode("utf-8", errors="ignore")
+                        except Exception:
+                            return str(data)
+        return None
+
+    async def _send_batch(self, alerts: List[Alert]):
+        if not alerts:
+            return
+        by_chat = defaultdict(list)
+        for a in alerts:
+            by_chat[a.chat_id].append(a)
+        final = []
+        for cid, als in by_chat.items():
+            items = [(a.tx_hash, a.log_index) for a in als]
+            existing = await self.db.dedup_batch(cid, self.key, items)
+            for a in als:
+                if (a.tx_hash, a.log_index) not in existing:
+                    final.append(a)
+        if final:
+            delivered = await asyncio.gather(*(self.notifier.send(a) for a in final))
+            await self.notifier.mark([a for a, ok in zip(final, delivered) if ok])
 
 # ═══════════════════════════════════════════════════
-# TRON MONITOR (Native + All TRC20)
+# TRON MONITOR
 # ═══════════════════════════════════════════════════
 
-class TRONMonitor(BaseMonitor):
-    async def start(self):
-        self.client = httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"})
+class TRONMonitor(Monitor):
+    __slots__ = ("_client",)
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier):
+        super().__init__(key, cfg, db, notifier)
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def run(self):
+        self._client = httpx.AsyncClient(timeout=30, headers={"Accept": "application/json"})
         self.running = True
-        logger.info("▶️  TRON started (poll %ss)", self.cfg["poll"])
         while self.running:
             try:
                 await self._tick()
             except Exception as exc:
-                logger.exception("TRON tick: %s", exc)
+                logger.exception("TRON: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        rows = await self.db.fetchall("SELECT DISTINCT address FROM addresses WHERE chain='tron'")
+        rows = await self.db.get_addresses_by_chain("tron")
         if not rows:
-            await asyncio.sleep(self.cfg["poll"])
+            await asyncio.sleep(self.cfg.poll)
             return
+        alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
+            # Native TRX
             try:
-                resp = await self.client.get(f"{self.cfg['api']}/accounts/{addr}/transactions", params={"limit": 10, "order_by": "block_timestamp,desc"})
-                data = resp.json()
+                data = (await self._client.get(f"{self.cfg.api}/accounts/{addr}/transactions", params={"limit": 10, "order_by": "block_timestamp,desc"})).json()
             except Exception as exc:
-                logger.warning("TRON API err: %s", exc)
-                continue
-            for tx in data.get("data", []):
+                logger.debug("TRON native: %s", exc)
+                data = {"data": []}
+            for tx_index, tx in enumerate(data.get("data", [])):
                 raw = tx.get("raw_data", {})
-                contract = raw.get("contract", [{}])[0]
-                param = contract.get("parameter", {}).get("value", {})
-                to_addr = param.get("to_address")
-                amount = param.get("amount", 0)
-                tx_hash = tx.get("txID")
-                if not to_addr or not tx_hash or to_addr != addr or amount == 0:
+                c = raw.get("contract", [{}])[0]
+                p = c.get("parameter", {}).get("value", {})
+                to_addr = p.get("to_address")
+                owner = p.get("owner_address")
+                amount = p.get("amount", 0)
+                txh = tx.get("txID")
+                if not txh or amount == 0:
                     continue
-                users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='tron' AND address=?", (addr,))
-                for u in users:
-                    cid = u["chat_id"]
-                    if await self._dedup(cid, tx_hash):
-                        continue
-                    amt = Decimal(amount) / Decimal(10 ** self.cfg["decimals"])
-                    amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                    from_addr = param.get("owner_address", "?")
-                    await self._notify(cid, "Incoming TRX Transfer", "⬇️", amt_str, self.cfg["native"],
-                                       from_addr, addr, tx_hash)
-                    await self._mark(cid, tx_hash, asset=self.cfg["native"], amount=amt_str)
+                direction = Direction.IN if to_addr == addr else (Direction.OUT if owner == addr else None)
+                if direction is None:
+                    continue
+                a = Decimal(amount) / Decimal(10 ** self.cfg.decimals)
+                alerts.append(Alert(
+                    chat_id=r["chat_id"], chain_key=self.key,
+                    title="Outgoing TRX" if direction == Direction.OUT else "Incoming TRX",
+                    amount_str=f"{a:,.6f}".rstrip("0").rstrip("."),
+                    asset=self.cfg.native, from_addr=owner or "?", to_addr=to_addr or addr,
+                    tx_hash=txh, direction=direction, log_index=tx_index,
+                ))
+            # TRC20
             try:
-                resp = await self.client.get(f"{self.cfg['api']}/accounts/{addr}/transactions/trc20", params={"limit": 10, "order_by": "block_timestamp,desc"})
-                data = resp.json()
+                data = (await self._client.get(f"{self.cfg.api}/accounts/{addr}/transactions/trc20", params={"limit": 10, "order_by": "block_timestamp,desc"})).json()
             except Exception as exc:
-                logger.warning("TRON TRC20 err: %s", exc)
-                continue
-            for tx in data.get("data", []):
-                if tx.get("to") != addr:
+                logger.debug("TRON TRC20: %s", exc)
+                data = {"data": []}
+            for tx_index, tx in enumerate(data.get("data", [])):
+                txh = tx.get("transaction_id")
+                if not txh:
                     continue
-                tx_hash = tx.get("transaction_id")
-                if not tx_hash:
+                to_addr = tx.get("to")
+                fr_addr = tx.get("from")
+                direction = Direction.IN if to_addr == addr else (Direction.OUT if fr_addr == addr else None)
+                if direction is None:
                     continue
-                amount = tx.get("value", "0")
                 token = tx.get("token_info", {})
-                symbol = token.get("symbol", "???")
-                name = token.get("name", "Unknown")
-                decimals = token.get("decimals", 6)
-                users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='tron' AND address=?", (addr,))
-                for u in users:
-                    cid = u["chat_id"]
-                    if await self._dedup(cid, tx_hash):
-                        continue
-                    amt = Decimal(amount) / Decimal(10 ** decimals)
-                    amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                    from_addr = tx.get("from", "?")
-                    asset_name = f"{name} ({symbol})"
-                    await self._notify(cid, "Incoming TRC-20 Token", "🟢", amt_str, asset_name,
-                                       from_addr, addr, tx_hash)
-                    await self._mark(cid, tx_hash, asset=asset_name, amount=amt_str)
-        await asyncio.sleep(self.cfg["poll"])
+                dec = token.get("decimals", 6)
+                a = Decimal(tx.get("value", "0")) / Decimal(10 ** dec)
+                alerts.append(Alert(
+                    chat_id=r["chat_id"], chain_key=self.key,
+                    title="Outgoing TRC-20" if direction == Direction.OUT else "Incoming TRC-20",
+                    amount_str=f"{a:,.6f}".rstrip("0").rstrip("."),
+                    asset=f"{token.get('name', 'Unknown')} ({token.get('symbol', '???')})",
+                    from_addr=fr_addr or "?", to_addr=to_addr or addr,
+                    tx_hash=txh, direction=direction, log_index=100000 + tx_index,
+                    contract_addr=token.get("address"),
+                ))
+        await self._send_batch(alerts)
+        await asyncio.sleep(self.cfg.poll)
 
+    async def _send_batch(self, alerts: List[Alert]):
+        if not alerts:
+            return
+        by_chat = defaultdict(list)
+        for a in alerts:
+            by_chat[a.chat_id].append(a)
+        final = []
+        for cid, als in by_chat.items():
+            items = [(a.tx_hash, a.log_index) for a in als]
+            existing = await self.db.dedup_batch(cid, self.key, items)
+            for a in als:
+                if (a.tx_hash, a.log_index) not in existing:
+                    final.append(a)
+        if final:
+            delivered = await asyncio.gather(*(self.notifier.send(a) for a in final))
+            await self.notifier.mark([a for a, ok in zip(final, delivered) if ok])
 
 # ═══════════════════════════════════════════════════
 # BTC MONITOR
 # ═══════════════════════════════════════════════════
 
-class BTCMonitor(BaseMonitor):
-    async def start(self):
-        self.client = httpx.AsyncClient(timeout=30)
+class BTCMonitor(Monitor):
+    __slots__ = ("_client",)
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier):
+        super().__init__(key, cfg, db, notifier)
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def run(self):
+        self._client = httpx.AsyncClient(timeout=30)
         self.running = True
-        logger.info("▶️  BTC started (poll %ss)", self.cfg["poll"])
         while self.running:
             try:
                 await self._tick()
             except Exception as exc:
-                logger.exception("BTC tick: %s", exc)
+                logger.exception("BTC: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        rows = await self.db.fetchall("SELECT DISTINCT address FROM addresses WHERE chain='btc'")
+        rows = await self.db.get_addresses_by_chain("btc")
         if not rows:
-            await asyncio.sleep(self.cfg["poll"])
+            await asyncio.sleep(self.cfg.poll)
             return
+        alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
             try:
-                resp = await self.client.get(f"{self.cfg['api']}/address/{addr}/txs")
-                txs = resp.json()
+                txs = (await self._client.get(f"{self.cfg.api}/address/{addr}/txs")).json()
             except Exception as exc:
-                logger.warning("BTC API err: %s", exc)
+                logger.debug("BTC API: %s", exc)
                 continue
             for tx in txs:
-                tx_hash = tx.get("txid")
-                if not tx_hash:
+                txh = tx.get("txid")
+                if not txh:
                     continue
-                received = 0
-                for vout in tx.get("vout", []):
-                    if addr in [vout.get("scriptpubkey_address"), vout.get("address")]:
-                        received += vout.get("value", 0)
-                if received == 0:
+                received = sum(v.get("value", 0) for v in tx.get("vout", []) if addr in [v.get("scriptpubkey_address"), v.get("address")])
+                sent = sum(vin.get("prevout", {}).get("value", 0) for vin in tx.get("vin", []) if addr in [vin.get("prevout", {}).get("scriptpubkey_address"), vin.get("prevout", {}).get("address")])
+                directions = []
+                if received > 0:
+                    directions.append((Direction.IN, received))
+                if sent > 0:
+                    directions.append((Direction.OUT, sent))
+                if not directions:
                     continue
-                users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='btc' AND address=?", (addr,))
-                for u in users:
-                    cid = u["chat_id"]
-                    if await self._dedup(cid, tx_hash):
-                        continue
-                    amt = Decimal(received) / Decimal(10 ** self.cfg["decimals"])
-                    amt_str = f"{amt:,.8f}".rstrip("0").rstrip(".")
-                    sender = "Unknown"
-                    vins = tx.get("vin", [])
-                    if vins:
-                        sender = vins[0].get("prevout", {}).get("scriptpubkey_address", "Unknown")
-                    await self._notify(cid, "Incoming BTC Transfer", "⬇️", amt_str, self.cfg["native"],
-                                       sender, addr, tx_hash)
-                    await self._mark(cid, tx_hash, asset=self.cfg["native"], amount=amt_str)
-        await asyncio.sleep(self.cfg["poll"])
+                sender = "Unknown"
+                vins = tx.get("vin", [])
+                if vins:
+                    sender = vins[0].get("prevout", {}).get("scriptpubkey_address", "Unknown")
+                for direction, amount in directions:
+                    a = Decimal(amount) / Decimal(10 ** self.cfg.decimals)
+                    alerts.append(Alert(
+                        chat_id=r["chat_id"], chain_key=self.key,
+                        title="Outgoing BTC" if direction == Direction.OUT else "Incoming BTC",
+                        amount_str=f"{a:,.8f}".rstrip("0").rstrip("."),
+                        asset=self.cfg.native, from_addr=sender, to_addr=addr,
+                        tx_hash=txh, direction=direction, log_index=0 if direction == Direction.IN else 1,
+                    ))
+        await self._send_batch(alerts)
+        await asyncio.sleep(self.cfg.poll)
 
+    async def _send_batch(self, alerts: List[Alert]):
+        if not alerts:
+            return
+        by_chat = defaultdict(list)
+        for a in alerts:
+            by_chat[a.chat_id].append(a)
+        final = []
+        for cid, als in by_chat.items():
+            items = [(a.tx_hash, a.log_index) for a in als]
+            existing = await self.db.dedup_batch(cid, self.key, items)
+            for a in als:
+                if (a.tx_hash, a.log_index) not in existing:
+                    final.append(a)
+        if final:
+            delivered = await asyncio.gather(*(self.notifier.send(a) for a in final))
+            await self.notifier.mark([a for a, ok in zip(final, delivered) if ok])
 
 # ═══════════════════════════════════════════════════
-# SUI MONITOR (native SUI + fungible Move coins)
-# Sui is not EVM-compatible: query transaction blocks addressed to each
-# wallet and use net-positive balance changes as incoming transfers.
-class SUIMonitor(BaseMonitor):
-    async def start(self):
-        self.client = httpx.AsyncClient(timeout=30)
+# SUI MONITOR
+# ═══════════════════════════════════════════════════
+
+class SUIMonitor(Monitor):
+    __slots__ = ("_client",)
+    def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier):
+        super().__init__(key, cfg, db, notifier)
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def run(self):
+        self._client = httpx.AsyncClient(timeout=30)
         self.running = True
-        logger.info("Sui started (poll %ss)", self.cfg["poll"])
         while self.running:
             try:
                 await self._tick()
             except Exception as exc:
-                logger.exception("Sui tick: %s", exc)
+                logger.exception("SUI: %s", exc)
                 await asyncio.sleep(5)
 
-    async def _rpc(self, method: str, params: list):
-        response = await self.client.post(self.cfg["rpc"], json={
-            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-        })
-        response.raise_for_status()
-        payload = response.json()
-        if "error" in payload:
-            raise RuntimeError(payload["error"])
-        return payload.get("result", {})
+    async def _rpc(self, method: str, params: list) -> dict:
+        r = await self._client.post(self.cfg.rpc, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        r.raise_for_status()
+        p = r.json()
+        if "error" in p:
+            raise RuntimeError(p["error"])
+        return p.get("result", {})
 
     async def _tick(self):
-        rows = await self.db.fetchall("SELECT DISTINCT address FROM addresses WHERE chain='sui'")
-        for row in rows:
-            address = row["address"]
-            result = await self._rpc("suix_queryTransactionBlocks", [{"ToAddress": address}, {
-                "showInput": True, "showEffects": True, "showBalanceChanges": True,
-            }, None, 50, True])
+        rows = await self.db.get_addresses_by_chain("sui")
+        alerts: List[Alert] = []
+        for r in rows:
+            addr = r["address"]
+            try:
+                result = await self._rpc("suix_queryTransactionBlocks", [{"ToAddress": addr}, {
+                    "showInput": True, "showEffects": True, "showBalanceChanges": True,
+                }, None, 50, True])
+            except Exception as exc:
+                logger.debug("SUI RPC: %s", exc)
+                continue
             for tx in result.get("data", []):
-                await self._process_tx(tx, address)
-        await asyncio.sleep(self.cfg["poll"])
-
-    async def _process_tx(self, tx: dict, address: str):
-        digest = tx.get("digest")
-        if not digest:
-            return
-        changes = tx.get("balanceChanges") or []
-        users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='sui' AND LOWER(address)=LOWER(?)", (address,))
-        for index, change in enumerate(changes):
-            owner = change.get("owner")
-            owner_address = owner.get("AddressOwner") if isinstance(owner, dict) else owner
-            if owner_address and owner_address.lower() != address.lower():
-                continue
-            raw_amount = int(change.get("amount", "0"))
-            if raw_amount <= 0:
-                continue
-            coin_type = change.get("coinType", "0x2::sui::SUI")
-            is_sui = coin_type.endswith("::sui::SUI")
-            decimals = self.cfg["decimals"] if is_sui else 9
-            symbol = self.cfg["native"] if is_sui else coin_type.rsplit("::", 1)[-1].upper()
-            amount = Decimal(raw_amount) / Decimal(10 ** decimals)
-            amount_str = f"{amount:,.9f}".rstrip("0").rstrip(".")
-            sender = (tx.get("transaction", {}).get("data", {}) or {}).get("sender", "Unknown")
-            for user in users:
-                chat_id = user["chat_id"]
-                log_index = index
-                if await self._dedup(chat_id, digest, log_index):
+                digest = tx.get("digest")
+                if not digest:
                     continue
-                await self._notify(chat_id, "Incoming Sui Transfer", "🟢", amount_str, symbol,
-                                   sender, address, digest)
-                await self._mark(chat_id, digest, log_index=log_index, asset=symbol, amount=amount_str)
+                for i, change in enumerate(tx.get("balanceChanges") or []):
+                    owner = change.get("owner")
+                    oa = owner.get("AddressOwner") if isinstance(owner, dict) else owner
+                    if not oa or oa.lower() != addr.lower():
+                        continue
+                    raw = int(change.get("amount", "0"))
+                    if raw == 0:
+                        continue
+                    direction = Direction.IN if raw > 0 else Direction.OUT
+                    ctype = change.get("coinType", "0x2::sui::SUI")
+                    is_sui = ctype.endswith("::sui::SUI")
+                    dec = self.cfg.decimals if is_sui else 9
+                    sym = self.cfg.native if is_sui else ctype.rsplit("::", 1)[-1].upper()
+                    a = Decimal(abs(raw)) / Decimal(10 ** dec)
+                    sender = (tx.get("transaction", {}).get("data", {}) or {}).get("sender", "Unknown")
+                    alerts.append(Alert(
+                        chat_id=r["chat_id"], chain_key=self.key,
+                        title="Outgoing Sui" if direction == Direction.OUT else "Incoming Sui",
+                        amount_str=f"{a:,.9f}".rstrip("0").rstrip("."),
+                        asset=sym, from_addr=sender, to_addr=addr,
+                        tx_hash=digest, direction=direction, log_index=i,
+                        contract_addr=None if is_sui else ctype,
+                    ))
+        await self._send_batch(alerts)
+        await asyncio.sleep(self.cfg.poll)
 
+    async def _send_batch(self, alerts: List[Alert]):
+        if not alerts:
+            return
+        by_chat = defaultdict(list)
+        for a in alerts:
+            by_chat[a.chat_id].append(a)
+        final = []
+        for cid, als in by_chat.items():
+            items = [(a.tx_hash, a.log_index) for a in als]
+            existing = await self.db.dedup_batch(cid, self.key, items)
+            for a in als:
+                if (a.tx_hash, a.log_index) not in existing:
+                    final.append(a)
+        if final:
+            delivered = await asyncio.gather(*(self.notifier.send(a) for a in final))
+            await self.notifier.mark([a for a, ok in zip(final, delivered) if ok])
 
+# ═══════════════════════════════════════════════════
 # TELEGRAM HANDLERS
 # ═══════════════════════════════════════════════════
 
-class AntiSpamMiddleware(BaseMiddleware):
-    """Rate-limit abusive users without restricting the configured admin."""
-    def __init__(self, max_updates: int = 30, window_seconds: int = 60):
-        self.max_updates = max_updates
-        self.window_seconds = window_seconds
-        self._events = defaultdict(deque)
-        self._last_notice = {}
+class RateLimiter:
+    __slots__ = ("max_upd", "window", "_events", "_last_notice")
+    def __init__(self, max_upd: int = 30, window: int = 60):
+        self.max_upd = max_upd
+        self.window = window
+        self._events: Dict[int, list] = defaultdict(list)
+        self._last_notice: Dict[int, float] = {}
 
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
         chat = getattr(event, "chat", None)
-        user_id = getattr(user, "id", None)
-        chat_id = getattr(chat, "id", None)
-        if user_id is None or str(chat_id) == str(ADMIN_CHAT_ID):
+        uid = getattr(user, "id", None)
+        cid = getattr(chat, "id", None)
+        if uid is None:
             return await handler(event, data)
 
+        admin = bool(Config.ADMIN_ID and str(cid) == str(Config.ADMIN_ID))
+        if not admin and "db" in globals():
+            row = await db.fetchone("SELECT is_admin, is_banned FROM users WHERE chat_id=?", (cid,))
+            admin = bool(row and row["is_admin"])
+            if row and row["is_banned"]:
+                await event.answer("Access denied. Your account is banned.")
+                return
+        if admin:
+            return await handler(event, data)
         now = time.monotonic()
-        bucket = self._events[user_id]
-        while bucket and now - bucket[0] > self.window_seconds:
-            bucket.popleft()
-        if len(bucket) >= self.max_updates:
-            if now - self._last_notice.get(user_id, 0) > 30:
-                self._last_notice[user_id] = now
-                await event.answer("⏳ Too many requests. Please wait a moment and try again.")
+        bucket = self._events[uid]
+        bucket[:] = [t for t in bucket if now - t <= self.window]
+        if len(bucket) >= self.max_upd:
+            if now - self._last_notice.get(uid, 0) > 30:
+                self._last_notice[uid] = now
+                await event.answer("⏳ Too many requests. Please wait.")
             return
         bucket.append(now)
         return await handler(event, data)
 
 
 router = Router()
-router.message.middleware(AntiSpamMiddleware())
-db: Database
-evm_cache: EVMTokenCache
-spl_cache: SPLTokenCache
-active_monitors: Dict[str, BaseMonitor] = {}
-app_started_at: Optional[datetime] = None
-CHAIN_ALIASES = {
-    "rh": "robinhood", "robinhoodchain": "robinhood",
-    "hyper": "hyperevm", "hyper-evm": "hyperevm",
-    "merlinchain": "merlin", "bitcoin": "btc",
-    "solana": "sol", "stellar": "xlm",
-}
+rate_limiter = RateLimiter()
+router.message.middleware(rate_limiter)
+router.callback_query.middleware(rate_limiter)
 
+db: DB
+tz_helper: TZHelper
+notifier: Notifier
+evm_cache: EVMCache
+spl_cache: SPLCache
+monitors: Dict[str, Monitor] = {}
+app_start: Optional[datetime] = None
+ask_sessions: Dict[int, float] = {}
 
-def validate_address(chain: str, address: str) -> bool:
-    if chain == "evm":
-        return address.startswith("0x") and len(address) == 42
-    elif chain == "ton":
-        return (address.startswith(("EQ", "UQ", "0:")) and len(address) >= 40)
-    elif chain == "xlm":
-        return address.startswith("G") and len(address) == 56
-    elif chain == "sol":
-        return 32 <= len(address) <= 44 and not address.startswith("0x")
-    elif chain == "tron":
-        return (address.startswith("T") and len(address) == 34) or (address.startswith("41") and len(address) == 42)
-    elif chain == "btc":
-        return address.startswith(("bc1", "1", "3")) and 25 <= len(address) <= 62
-    elif chain == "sui":
-        return bool(re.fullmatch(r"0x[0-9a-fA-F]{1,64}", address))
-    return False
+# ── Helpers ────────────────────────────────────────
 
+_RE_EVM = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_RE_TON = re.compile(r"^(EQ|UQ|0:)[A-Za-z0-9_-]{30,}$")
+_RE_XLM = re.compile(r"^G[A-Z0-9]{55}$")
+_RE_TRON = re.compile(r"^T[A-Za-z0-9]{33}$")
+_RE_BTC = re.compile(r"^(bc1|[13])[a-zA-HJ-NP-Z0-9]{24,62}$")
+_RE_SUI = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
-TELEGRAM_MAX_LEN = 4096
+CHAIN_ALIASES = {"rh": "robinhood", "robinhoodchain": "robinhood", "hyper": "hyperevm",
+                 "hyper-evm": "hyperevm", "merlinchain": "merlin", "bitcoin": "btc",
+                 "solana": "sol", "stellar": "xlm"}
 
+def detect_chain(addr: str) -> Optional[str]:
+    a = addr.strip()
+    if _RE_EVM.match(a):
+        return "evm"
+    if _RE_TON.match(a):
+        return "ton"
+    if _RE_XLM.match(a):
+        return "xlm"
+    if _RE_TRON.match(a):
+        return "tron"
+    if _RE_BTC.match(a):
+        return "btc"
+    if _RE_SUI.match(a):
+        return "sui"
+    if 32 <= len(a) <= 44 and not a.startswith(("0x", "T")):
+        return "sol"
+    return None
 
-def _chunk_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> List[str]:
-    """Split text into Telegram-safe chunks, breaking on blank-line boundaries
-    so a single entry (one address, one history row) is never cut mid-way."""
+def auto_label(addr: str, chain: str) -> str:
+    cfg = CHAINS_BY_KEY.get(chain)
+    name = cfg.name if cfg else chain.upper()
+    return f"{name} {addr[:6]}...{addr[-4:]}"
+
+def mask_address(addr: str, start: int = 8, end: int = 7) -> str:
+    """Show only the beginning and end of an address in admin views."""
+    if len(addr) <= start + end + 3:
+        return addr
+    return f"{addr[:start]}...{addr[-end:]}"
+
+TELEGRAM_MAX = 4096
+
+def chunk_text(text: str, limit: int = TELEGRAM_MAX) -> List[str]:
     if len(text) <= limit:
         return [text]
-    chunks: List[str] = []
+    chunks = []
     current = ""
     for block in text.split("\n\n"):
         piece = block + "\n\n"
@@ -1153,7 +1586,6 @@ def _chunk_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> List[str]:
             if current:
                 chunks.append(current.rstrip("\n"))
                 current = ""
-            # A single block larger than the whole limit still has to split.
             while len(piece) > limit:
                 chunks.append(piece[:limit])
                 piece = piece[limit:]
@@ -1162,823 +1594,1109 @@ def _chunk_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> List[str]:
         chunks.append(current.rstrip("\n"))
     return chunks
 
+async def send_long(msg: types.Message, text: str, **kw):
+    for c in chunk_text(text):
+        await msg.answer(c, **kw)
 
-async def send_long(message: types.Message, text: str, **kwargs):
-    """message.answer() that transparently splits output over Telegram's
-    4096-character limit instead of raising and leaving the user with no
-    response at all (see /history, /export, /list, /report)."""
-    for chunk in _chunk_text(text):
-        await message.answer(chunk, **kwargs)
+async def is_admin(cid: int) -> bool:
+    if Config.ADMIN_ID and str(cid) == str(Config.ADMIN_ID):
+        return True
+    pref = await db.get_user_prefs(cid)
+    return bool(pref.get("admin", 0))
+
+def local_project_answer(question: str) -> str:
+    """Answer project questions locally from the bot's configured features."""
+    q = question.lower().strip()
+    chain_count = len(_CHAINS)
+    evm_count = len(EVM_KEYS)
+    other_names = ", ".join(c.name for c in _CHAINS if c.type != "evm")
+
+    if any(word in q for word in ("supported", "support", "chain", "network")):
+        return (
+            f"<b>Supported networks</b>\n\n"
+            f"The monitor supports <b>{chain_count} networks</b>: {evm_count} EVM networks plus {other_names}.\n\n"
+            "EVM wallets are added once and monitored across every configured EVM network."
+        )
+    if any(word in q for word in ("add wallet", "add address", "monitor wallet", "watch wallet")):
+        return (
+            "<b>Add a wallet</b>\n\n"
+            "Use automatic detection:\n"
+            "<code>/add 0xYourAddress My Wallet</code>\n\n"
+            "Or specify a chain:\n"
+            "<code>/add ethereum 0xYourAddress My Wallet</code>\n\n"
+            "The final text is saved as your custom wallet label."
+        )
+    if any(word in q for word in ("label", "rename", "name wallet")):
+        return (
+            "<b>Custom wallet labels</b>\n\n"
+            "Add a label while adding a wallet:\n"
+            "<code>/add 0xYourAddress Treasury</code>\n\n"
+            "Change it later with:\n"
+            "<code>/label ethereum 0xYourAddress Treasury</code>"
+        )
+    if any(word in q for word in ("incoming", "outgoing", "in/out", "transfer")):
+        return (
+            "<b>Transfer monitoring</b>\n\n"
+            "The bot detects incoming and outgoing native-asset and token transfers. "
+            "Alerts include the amount, sender, receiver, transaction link, block, time, and token contract when available."
+        )
+    if any(word in q for word in ("contract", "token address", "ca")):
+        return (
+            "<b>Token contract addresses</b>\n\n"
+            "Token alerts include the contract or token identifier. Native coins do not show a contract because they are network assets."
+        )
+    if any(word in q for word in ("admin", "ban", "unban", "spam")):
+        return (
+            "<b>Admin controls</b>\n\n"
+            "Admins can use <code>/admin</code>, <code>/admin_user &lt;chat_id&gt;</code>, "
+            "<code>/ban &lt;chat_id&gt;</code>, <code>/unban &lt;chat_id&gt;</code>, and "
+            "<code>/broadcast message</code>. Anti-spam protection does not apply to admins."
+        )
+    if any(word in q for word in ("timezone", "time", "ist", "utc")):
+        return (
+            "<b>Timezone</b>\n\n"
+            "Set your display timezone with:\n"
+            "<code>/timezone Asia/Kolkata</code>\n\n"
+            "Alert timestamps are formatted using your saved timezone."
+        )
+    if any(word in q for word in ("history", "past alert", "previous alert")):
+        return "<b>Alert history</b>\n\nUse <code>/history [limit]</code> to view up to 50 saved alerts, or <code>/clearhistory</code> to remove them."
+    if any(word in q for word in ("rpc", "backup", "connection", "offline", "reconnect")):
+        return (
+            "<b>RPC reliability</b>\n\n"
+            "Each EVM network has a primary RPC and multiple backup endpoints. "
+            "The monitor retries failed connections with backoff and resumes automatically when an endpoint recovers. "
+            "Use <code>/status</code> to check network health."
+        )
+    if any(word in q for word in ("private key", "security", "safe", "read only")):
+        return (
+            "<b>Security</b>\n\n"
+            "The monitor is read-only. It does not request, store, or use private keys and never signs transactions. "
+            "Keep your <code>.env</code> file private."
+        )
+    if any(word in q for word in ("command", "help", "what can", "how use")):
+        return "<b>Available commands</b>\n\nUse <code>/help</code> for the full command list. Start with <code>/add &lt;address&gt; [label]</code>, then use <code>/status</code> and <code>/history</code>."
+    return (
+        "I can answer questions about this monitor locally—supported networks, wallet setup, labels, "
+        "IN/OUT alerts, token contracts, history, timezones, RPC backups, admin controls, and security.\n\n"
+        "Try: <code>/ask how do I add a wallet?</code>"
+    )
+
+@router.message(Command("ask"))
+async def cmd_ask(msg: types.Message):
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        ask_sessions[msg.chat.id] = time.monotonic()
+        await reply_del(
+            msg,
+            "<b>💬 Project Assistant</b>\n\n"
+            "What is your question about this bot?\n"
+            "You can ask about wallets, chains, IN/OUT transfers, alerts, history, RPC backups, or admin features.\n\n"
+            "<i>Type your question in the next message.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await reply_del(msg, local_project_answer(parts[1]), parse_mode=ParseMode.HTML)
 
 
-async def send_long_callback(callback: types.CallbackQuery, text: str, reply_markup=None, **kwargs):
-    """Same as send_long, but edits the callback's existing message for the
-    first chunk (matching normal inline-menu behavior) and sends any
-    overflow as follow-up messages."""
-    chunks = _chunk_text(text)
-    await callback.message.edit_text(chunks[0], reply_markup=reply_markup if len(chunks) == 1 else None, **kwargs)
-    for chunk in chunks[1:]:
-        is_last = chunk == chunks[-1]
-        await callback.message.answer(chunk, reply_markup=reply_markup if is_last else None, **kwargs)
+def _is_pending_ask(msg: types.Message) -> bool:
+    """Match the next normal text message after a user starts /ask."""
+    started = ask_sessions.get(msg.chat.id)
+    if not started:
+        return False
+    if time.monotonic() - started > 300:
+        ask_sessions.pop(msg.chat.id, None)
+        return False
+    return bool(msg.text and not msg.text.lstrip().startswith("/"))
 
+
+@router.message(_is_pending_ask)
+async def cmd_ask_question(msg: types.Message):
+    ask_sessions.pop(msg.chat.id, None)
+    question = (msg.text or "").strip()
+    answer = local_project_answer(question)
+    await reply_del(
+        msg,
+        f"<b>💬 Project Assistant</b>\n\n"
+        f"<b>Your question:</b> <i>{html.escape(question[:300])}</i>\n\n"
+        f"{answer}\n\n"
+        "<i>Ask another question anytime with /ask.</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
 # ── /start ─────────────────────────────────────────
 
 @router.message(Command("start"))
-async def cmd_start(message: types.Message):
-    chat_id = message.chat.id
-    user = message.from_user
+async def cmd_start(msg: types.Message):
+    cid = msg.chat.id
+    u = msg.from_user
     await db.execute("INSERT OR IGNORE INTO users (chat_id, username, first_name) VALUES (?,?,?)",
-                     (chat_id, user.username, user.first_name))
-
+                     (cid, u.username, u.first_name))
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Add Address", callback_data="menu_add"),
-         InlineKeyboardButton(text="📋 My List", callback_data="menu_list")],
-        [InlineKeyboardButton(text="📜 History", callback_data="menu_history"),
-         InlineKeyboardButton(text="⚙️ Settings", callback_data="menu_settings")],
-        [InlineKeyboardButton(text="❓ Help", callback_data="menu_help")],
+        [InlineKeyboardButton(text="➕ Add Address", callback_data="m_add"),
+         InlineKeyboardButton(text="📋 My List", callback_data="m_list")],
+        [InlineKeyboardButton(text="📜 History", callback_data="m_hist"),
+         InlineKeyboardButton(text="⚙️ Settings", callback_data="m_set")],
+        [InlineKeyboardButton(text="❓ Help", callback_data="m_help")],
     ])
-
-    evm_count = sum(1 for c in CHAINS.values() if c.get("type") == "evm")
-    other = [f"{c['emoji']} {c['name']}" for k, c in CHAINS.items() if c.get("type") != "evm"]
-
-    await message.answer(
-        f"<b>👋 Welcome to telegram-multichain-monitor</b>\n\n"
-        f"I watch your wallets across <b>{len(CHAINS)} chains</b> and alert you for <b>incoming and outgoing transfers</b>.\n\n"
-        f"<b>⛓️ EVM:</b> <code>{evm_count} chains</code> (all ERC-20s)\n"
-        f"<b>⛓️ Others:</b> {', '.join(other)}\n\n"
-        f"<b>Quick start</b>\n"
-        f"<code>/add evm 0xYourAddress Wallet</code>\n"
-        f"<code>/status</code> — health and latest alert\n"
+    evm_n = len(EVM_KEYS)
+    other = [f"{c.emoji} {c.name}" for c in _CHAINS if c.type != "evm"]
+    await msg.answer(
+        f"<b>🔔 Welcome to Multi-Chain Monitor</b>\n\n"
+        f"Professional wallet activity alerts for <b>{len(_CHAINS)} blockchain networks</b>.\n"
+        f"Track <b>incoming and outgoing</b> native-asset and token transfers in real time.\n\n"
+        f"<b>What you get</b>\n"
+        f"• Automatic chain detection\n"
+        f"• Native coins and tokens\n"
+        f"• Transaction links and contract addresses\n"
+        f"• Custom wallet labels and timezone support\n"
+        f"• Privacy-first, read-only monitoring\n\n"
+        f"<b>Get started</b>\n"
+        f"1. Tap <b>Add Address</b> below.\n"
+        f"2. Send a wallet address, optionally followed by a custom label.\n"
+        f"3. Receive alerts whenever activity is detected.\n\n"
+        f"<b>Useful commands</b>\n"
+        f"<code>/add 0xYourAddress My Wallet</code>\n"
+        f"<code>/status</code> — monitor health\n"
         f"<code>/help</code> — all commands\n\n"
-        f"<i>Tap a button below to get started.</i>",
+        f"<i>Your wallet is monitored in read-only mode. Private keys are never requested.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=kb,
+    )
+
+# ── Callbacks ──────────────────────────────────────
+
+@router.callback_query(F.data == "m_add")
+async def cb_add(cb: types.CallbackQuery):
+    await cb.message.edit_text(
+        "<b>➕ Add Address</b>\n\n"
+        "Bot <b>auto-detects</b> chain from address format!\n\n"
+        "<code>/add 0x71C7...8976F</code> — EVM\n"
+        "<code>/add EQAbCd...abcdef</code> — TON\n"
+        "<code>/add GABC123...Exchange</code> — Stellar\n"
+        "<code>/add 7xabc...defg</code> — Solana\n"
+        "<code>/add TAbCdE...TRXWallet</code> — TRON\n"
+        "<code>/add bc1qabc...defg</code> — Bitcoin\n\n"
+        "Optional label at end:\n<code>/add 0x... MyWallet</code>",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb,
     )
+    await cb.answer()
 
-
-# ── Callback router ────────────────────────────────
-
-@router.callback_query(F.data == "menu_add")
-async def cb_menu_add(callback: types.CallbackQuery):
-    await callback.message.edit_text(
-        "<b>➕ Add an Address</b>\n\n"
-        "<code>/add &lt;chain&gt; &lt;address&gt; [label]</code>\n\n"
-        "Examples:\n"
-        "<code>/add evm 0x... MetaMask</code>\n"
-        "<code>/add ton EQ... MainTON</code>\n"
-        "<code>/add sol 7x... Phantom</code>\n"
-        "<code>/add btc bc1... ColdStorage</code>",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu_list")
-async def cb_menu_list(callback: types.CallbackQuery):
-    await callback.answer()
-    chat_id = callback.message.chat.id
-    rows = await db.fetchall(
-        "SELECT chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain, created_at",
-        (chat_id,),
-    )
+@router.callback_query(F.data == "m_list")
+async def cb_list(cb: types.CallbackQuery):
+    cid = cb.message.chat.id
+    rows = await db.fetchall("SELECT chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain", (cid,))
     if not rows:
-        await callback.message.edit_text(
-            "📭 No addresses monitored.\nUse <code>/add</code> to start.",
-            parse_mode=ParseMode.HTML,
-        )
+        await cb.message.edit_text("📭 No addresses. Use <code>/add</code>.", parse_mode=ParseMode.HTML)
         return
-    text = "<b>📋 Your Monitored Addresses</b>\n\n"
-    current = ""
+    text = "<b>📋 Your Addresses</b>\n\n"
+    cur = ""
     for r in rows:
-        if r["chain"] != current:
-            current = r["chain"]
-            cfg = CHAINS.get(current, {})
-            emoji = "⛓️" if current == "evm" else cfg.get("emoji", "⬜")
-            name = "All EVM Chains" if current == "evm" else cfg.get("name", current)
+        if r["chain"] != cur:
+            cur = r["chain"]
+            cfg = CHAINS_BY_KEY.get(cur)
+            emoji = "⛓️" if cur == "evm" else (cfg.emoji if cfg else "⬜")
+            name = "All EVM" if cur == "evm" else (cfg.name if cfg else cur)
             text += f"\n{emoji} <b>{name}</b>\n"
-        a = r["address"]
-        lab = r["label"] or "No Label"
-        short = a
-        text += f"  ├ <code>{short}</code> — <i>{lab}</i>\n"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Back", callback_data="menu_back")]
-    ])
-    await send_long_callback(callback, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        text += f"  ├ <code>{r['address']}</code> — <i>{r['label'] or 'No Label'}</i>\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="m_back")]])
+    await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await cb.answer()
 
-
-@router.callback_query(F.data == "menu_history")
-async def cb_menu_history(callback: types.CallbackQuery):
-    await callback.answer()
-    chat_id = callback.message.chat.id
+@router.callback_query(F.data == "m_hist")
+async def cb_hist(cb: types.CallbackQuery):
+    cid = cb.message.chat.id
     rows = await db.fetchall(
-        "SELECT chain, tx_hash, asset, amount, memo, created_at FROM notifications "
-        "WHERE chat_id=? ORDER BY created_at DESC LIMIT 10",
-        (chat_id,),
+        "SELECT chain, tx_hash, asset, amount, direction, notification_timezone, contract_addr, created_at FROM notifications "
+        "WHERE chat_id=? ORDER BY created_at DESC LIMIT 10", (cid,)
     )
     if not rows:
-        await callback.message.edit_text(
-            "📭 No history yet.\nNotifications will appear here once you receive transfers.",
-            parse_mode=ParseMode.HTML,
-        )
+        await cb.message.edit_text("📭 No history yet.", parse_mode=ParseMode.HTML)
         return
-    text = "<b>📜 Recent Notification History</b>\n\n"
+    text = "<b>📜 Recent History</b>\n\n"
     for i, r in enumerate(rows, 1):
-        cfg = CHAINS.get(r["chain"], {})
-        emoji = cfg.get("emoji", "⬜")
-        direction = "OUTGOING" if str(r["asset"] or "").startswith("Sent") or str(r["amount"] or "").startswith("-") else "INCOMING"
-        text += f"<b>{direction}</b> — {cfg.get('name', r['chain'])}\n"
-        tx_short = r["tx_hash"]
+        cfg = CHAINS_BY_KEY.get(r["chain"])
+        emoji = cfg.emoji if cfg else "⬜"
+        badge = "🔴 OUT" if r["direction"] == "outgoing" else "🟢 IN"
         dt = datetime.fromisoformat(r["created_at"])
-        time_str = fmt_time(db, chat_id, dt)
-        text += (
-            f"{i}. {emoji} <code>{r['asset']}</code> | <code>{r['amount']}</code>\n"
-            f"   └ <a href='{cfg.get('explorer', '')}{r['tx_hash']}'>{tx_short}</a> | {time_str}\n\n"
-        )
+        ts = await tz_helper.fmt(cid, dt, stored_tz=r["notification_timezone"])
+        if r["contract_addr"]:
+            text += f"Token contract: <code>{r['contract_addr']}</code>\n"
+        text += f"{i}. {badge} {emoji} <code>{r['asset']}</code> | <code>{r['amount']}</code>\n   └ <a href='{(cfg.explorer if cfg else '')}{r['tx_hash']}'>{r['tx_hash']}</a> | {ts}\n\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑️ Clear History", callback_data="clear_history_confirm"),
-         InlineKeyboardButton(text="🔙 Back", callback_data="menu_back")]
+        [InlineKeyboardButton(text="🗑️ Clear", callback_data="clr_conf"),
+         InlineKeyboardButton(text="🔙 Back", callback_data="m_back")]
     ])
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+    await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+    await cb.answer()
 
-
-@router.callback_query(F.data == "menu_settings")
-async def cb_menu_settings(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    row = await db.fetchone("SELECT timezone FROM users WHERE chat_id=?", (chat_id,))
-    tz = row["timezone"] if row and row["timezone"] else "UTC"
-    addr_count = await db.fetchone("SELECT COUNT(*) as c FROM addresses WHERE chat_id=?", (chat_id,))
-    notif_count = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=?", (chat_id,))
+@router.callback_query(F.data == "m_set")
+async def cb_set(cb: types.CallbackQuery):
+    cid = cb.message.chat.id
+    tz = await tz_helper.get(cid)
+    ac = await db.fetchone("SELECT COUNT(*) as c FROM addresses WHERE chat_id=?", (cid,))
+    nc = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=?", (cid,))
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌍 Change Timezone", callback_data="menu_timezone")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="menu_back")],
+        [InlineKeyboardButton(text="🌍 Timezone", callback_data="m_tz")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="m_back")],
     ])
-    await callback.message.edit_text(
-        f"<b>⚙️ Your Settings</b>\n\n"
+    await cb.message.edit_text(
+        f"<b>⚙️ Settings</b>\n\n"
         f"<b>🌍 Timezone:</b> <code>{tz}</code>\n"
-        f"<b>📬 Addresses:</b> <code>{addr_count['c']}</code>\n"
-        f"<b>🔔 Notifications:</b> <code>{notif_count['c']}</code>\n\n"
-        f"<i>Use /timezone to set your local time.</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
+        f"<b>📬 Addresses:</b> <code>{ac['c']}</code>\n"
+        f"<b>🔔 Notifications:</b> <code>{nc['c']}</code>\n\n"
+        f"<i>Use /timezone to set local time.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=kb,
     )
-    await callback.answer()
+    await cb.answer()
 
+@router.callback_query(F.data == "m_tz")
+async def cb_tz(cb: types.CallbackQuery):
+    btns = [[InlineKeyboardButton(text=f"🌍 {tz}", callback_data=f"tz_{tz}")] for tz in POPULAR_TZS]
+    btns.append([InlineKeyboardButton(text="🔙 Back", callback_data="m_set")])
+    await cb.message.edit_text(
+        "<b>🌍 Select Timezone</b>\n\nTap below or use:\n<code>/timezone Europe/Paris</code>",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
+    )
+    await cb.answer()
 
-@router.callback_query(F.data == "menu_timezone")
-async def cb_menu_timezone(callback: types.CallbackQuery):
-    await callback.message.edit_text(
-        "<b>🌍 Set Timezone</b>\n\n"
-        "Use the command:\n"
-        "<code>/timezone Asia/Kolkata</code>\n"
-        "<code>/timezone America/New_York</code>\n"
-        "<code>/timezone Europe/London</code>\n\n"
-        "Or type <code>/timezone</code> to see quick picks.",
+@router.callback_query(F.data.startswith("tz_"))
+async def cb_tzset(cb: types.CallbackQuery):
+    tz = cb.data[3:]
+    cid = cb.message.chat.id
+    if tz not in available_timezones():
+        await cb.answer("Invalid", show_alert=True)
+        return
+    await db.execute("UPDATE users SET timezone=? WHERE chat_id=?", (tz, cid))
+    tz_helper.invalidate(cid)
+    sample = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M:%S %Z")
+    await cb.message.edit_text(
+        f"✅ <b>Timezone: {tz}</b>\nSample: <code>{sample}</code>",
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer()
+    await cb.answer("Updated!")
 
-
-@router.callback_query(F.data == "menu_help")
-async def cb_menu_help(callback: types.CallbackQuery):
-    await callback.message.edit_text(
+@router.callback_query(F.data == "m_help")
+async def cb_help(cb: types.CallbackQuery):
+    await cb.message.edit_text(
         "<b>📖 Help</b>\n\n"
-        "<b>/add</b> <code>&lt;chain&gt; &lt;address&gt; [label]</code>\n"
-        "<b>/remove</b> <code>&lt;chain&gt; &lt;address&gt;</code>\n"
-        "<b>/rename</b> <code>&lt;chain&gt; &lt;address&gt; &lt;label&gt;</code>\n"
-        "<b>/list</b> [chain] — Show your addresses\n"
-        "<b>/report</b> — Wallets with alert counts\n"
-        "<b>/history</b> [limit] — Notification history\n"
+        "<b>/add</b> <code>&lt;addr&gt; [label]</code> — Auto-detects chain\n"
+        "<b>/remove</b> <code>&lt;chain&gt; &lt;addr&gt;</code>\n"
+        "<b>/rename</b> <code>&lt;chain&gt; &lt;addr&gt; &lt;label&gt;</code>\n"
+        "<b>/list</b> [chain] — Show addresses\n"
+        "<b>/report</b> — Wallet alert counts\n"
+        "<b>/history</b> [limit] — History\n"
         "<b>/clearhistory</b> — Clear history\n"
-        "<b>/pause</b> — Pause notifications\n"
-        "<b>/resume</b> — Resume notifications\n"
-        "<b>/timezone</b> <code>&lt;zone&gt;</code> — Set timezone\n"
+        "<b>/pause</b> — Pause alerts\n"
+        "<b>/resume</b> — Resume alerts\n"
+        "<b>/timezone</b> <code>&lt;zone&gt;</code>\n"
         "<b>/stats</b> — Your stats\n"
-        "<b>/status</b> — Monitor health and active networks\n"
-        "<b>/test</b> — Send a sample alert\n"
+        "<b>/status</b> — Health check\n"
+        "<b>/test</b> — Sample alert\n"
         "<b>/export</b> — Export addresses\n"
         "<b>/chains</b> — Supported chains\n"
         "<b>/help</b> — This message\n\n"
-        "<i>EVM addresses monitor all 19 EVM chains at once.</i>",
+        "<i>💡 Paste any address — bot figures out the chain!</i>\n"
+        "<i>💡 Burn addresses blocked on all chains.</i>\n"
+        "<i>💡 Full IN+OUT detection on ALL chains.</i>",
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer()
+    await cb.answer()
 
-
-@router.callback_query(F.data == "menu_back")
-async def cb_menu_back(callback: types.CallbackQuery):
-    await callback.answer()
+@router.callback_query(F.data == "m_back")
+async def cb_back(cb: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Add Address", callback_data="menu_add"),
-         InlineKeyboardButton(text="📋 My List", callback_data="menu_list")],
-        [InlineKeyboardButton(text="📜 History", callback_data="menu_history"),
-         InlineKeyboardButton(text="⚙️ Settings", callback_data="menu_settings")],
-        [InlineKeyboardButton(text="❓ Help", callback_data="menu_help")],
+        [InlineKeyboardButton(text="➕ Add", callback_data="m_add"),
+         InlineKeyboardButton(text="📋 List", callback_data="m_list")],
+        [InlineKeyboardButton(text="📜 History", callback_data="m_hist"),
+         InlineKeyboardButton(text="⚙️ Settings", callback_data="m_set")],
+        [InlineKeyboardButton(text="❓ Help", callback_data="m_help")],
     ])
-    await callback.message.edit_text(
-        "<b>👋 telegram-multichain-monitor</b>\n\n<i>Tap a button below:</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
+    await cb.message.edit_text("<b>👋 Multi-Chain Monitor</b>\n\n<i>Tap a button:</i>",
+                               parse_mode=ParseMode.HTML, reply_markup=kb)
+    await cb.answer()
 
-
-@router.callback_query(F.data == "clear_history_confirm")
-async def cb_clear_history(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    await db.execute("DELETE FROM notifications WHERE chat_id=?", (chat_id,))
-    await callback.message.edit_text("🗑️ <b>History cleared.</b>", parse_mode=ParseMode.HTML)
-    await callback.answer("History cleared", show_alert=True)
-
+@router.callback_query(F.data == "clr_conf")
+async def cb_clr(cb: types.CallbackQuery):
+    cid = cb.message.chat.id
+    await db.execute("DELETE FROM notifications WHERE chat_id=?", (cid,))
+    await cb.message.edit_text("🗑️ <b>History cleared.</b>", parse_mode=ParseMode.HTML)
+    await cb.answer("Cleared", show_alert=True)
 
 # ── /add ───────────────────────────────────────────
 
 @router.message(Command("add"))
-async def cmd_add(message: types.Message):
-    parts = message.text.split(maxsplit=3)
-    if len(parts) < 3:
-        await message.answer(
-            "❌ <b>Usage:</b> <code>/add &lt;chain&gt; &lt;address&gt; [label]</code>\n\n"
+async def cmd_add(msg: types.Message):
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 2:
+        await reply_del(
+            msg,
+            "❌ <b>Usage:</b> <code>/add &lt;address&gt; [label]</code>\n\n"
             "<b>Examples:</b>\n"
-            "<code>/add evm 0x71C7656EC7ab88b098defB751B7401B5f6d8976F MetaMask</code>\n"
-            "<code>/add ton EQAbCdEfGhIjKlMnOpQrStUvWxYz1234567890abcdef MainTON</code>\n"
-            "<code>/add xlm GABC123DEF456GHI789JKL012MNO345PQR678STU901VWX234YZ Exchange</code>\n"
-            "<code>/add sol 7xabc...defg Phantom</code>\n"
-            "<code>/add tron TAbCdEfGhIjKlMnOpQrStUvWxYz123456 TRXWallet</code>\n"
-            "<code>/add btc bc1qabc...defg ColdStorage</code>",
+            "<code>/add 0x71C7...8976F</code> — EVM\n"
+            "<code>/add EQAbCd...abcdef</code> — TON\n"
+            "<code>/add GABC123...Exchange</code> — Stellar\n"
+            "<code>/add 7xabc...defg Phantom</code> — Solana\n"
+            "<code>/add TAbCdE...TRXWallet</code> — TRON\n"
+            "<code>/add bc1qabc...defg ColdStorage</code> — Bitcoin\n\n"
+            "<i>💡 Bot auto-detects chain from address format!</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chain_input = parts[1].lower().strip()
-    chain_input = CHAIN_ALIASES.get(chain_input, chain_input)
-    address = parts[2].strip()
-    label = parts[3].strip() if len(parts) > 3 else None
+    first = parts[1].strip()
+    chain_in = CHAIN_ALIASES.get(first.lower(), first.lower())
+
+    if chain_in in CHAINS_BY_KEY or chain_in == "evm":
+        if len(parts) < 3:
+            await reply_del(msg, "❌ <code>/add &lt;chain&gt; &lt;address&gt; [label]</code>\nOr: <code>/add &lt;address&gt; [label]</code>", parse_mode=ParseMode.HTML)
+            return
+        chain = "evm" if chain_in in CHAINS_BY_KEY and CHAINS_BY_KEY[chain_in].type == "evm" else chain_in
+        addr = parts[2].strip().split()[0]
+        label = " ".join(parts[2].strip().split()[1:]) if len(parts[2].strip().split()) > 1 else None
+    else:
+        addr = first
+        label = parts[2].strip() if len(parts) > 2 else None
+        detected = detect_chain(addr)
+        if not detected:
+            await reply_del(
+                msg,
+                "❌ Could not auto-detect chain.\n\n"
+                "Use explicit format:\n<code>/add &lt;chain&gt; &lt;address&gt; [label]</code>\n"
+                "Valid: <code>evm, ton, xlm, sol, tron, btc, sui</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        chain = detected
+
+    # Validate
+    cfg = CHAINS_BY_KEY.get(chain)
+    if chain == "evm":
+        valid = _RE_EVM.match(addr) is not None
+    elif chain == "ton":
+        valid = _RE_TON.match(addr) is not None
+    elif chain == "xlm":
+        valid = _RE_XLM.match(addr) is not None
+    elif chain == "sol":
+        valid = 32 <= len(addr) <= 44 and not addr.startswith("0x")
+    elif chain == "tron":
+        valid = _RE_TRON.match(addr) is not None
+    elif chain == "btc":
+        valid = _RE_BTC.match(addr) is not None
+    elif chain == "sui":
+        valid = _RE_SUI.match(addr) is not None
+    else:
+        valid = False
+
+    if not valid:
+        await reply_del(msg, f"❌ Invalid address for <b>{cfg.name if cfg else chain}</b>.", parse_mode=ParseMode.HTML)
+        return
+
+    # Burn check
+    if is_burn(chain, addr):
+        await reply_del(msg, burn_warn(chain, addr), parse_mode=ParseMode.HTML)
+        return
+
+    # Label
     if label and len(label) > 80:
-        await message.answer("❌ Label must be 80 characters or fewer.", parse_mode=ParseMode.HTML)
+        await reply_del(msg, "❌ Label max 80 chars.", parse_mode=ParseMode.HTML)
         return
-    # Sanitize once at the boundary: an unescaped '<', '>' or '&' in a label
-    # would break every future HTML-parsed message that includes it --
-    # /list, /rename confirmations, wallet reports, and real transfer alerts.
-    if label:
-        label = html_lib.escape(label, quote=False)
+    label = html.escape(label, quote=False) if label else auto_label(addr, chain)
 
-    chain = "evm" if chain_input in CHAINS and CHAINS[chain_input].get("type") == "evm" else chain_input
-
-    if chain not in CHAINS and chain != "evm":
-        valid = "evm, " + ", ".join(k for k, c in CHAINS.items() if c.get("type") != "evm")
-        await message.answer(f"❌ Unknown chain. Valid: <code>{valid}</code>", parse_mode=ParseMode.HTML)
-        return
-
-    if not validate_address(chain, address):
-        await message.answer(f"❌ Invalid address format for <b>{CHAINS.get(chain, {}).get('name', chain)}</b>.", parse_mode=ParseMode.HTML)
-        return
-
-    chat_id = message.chat.id
-    exists = await db.fetchone(
-        "SELECT 1 FROM addresses WHERE chat_id=? AND chain=? AND LOWER(address)=?",
-        (chat_id, chain, address.lower()),
-    )
+    cid = msg.chat.id
+    exists = await db.fetchone("SELECT 1 FROM addresses WHERE chat_id=? AND chain=? AND address=? COLLATE NOCASE", (cid, chain, addr))
     if exists:
-        await message.answer("⚠️ This address is already monitored.")
+        await reply_del(msg, "⚠️ Already monitored.", parse_mode=ParseMode.HTML)
         return
 
-    await db.execute(
-        "INSERT INTO addresses (chat_id, address, chain, label) VALUES (?,?,?,?)",
-        (chat_id, address, chain, label),
-    )
-
-    chain_name = "All EVM Chains" if chain == "evm" else CHAINS[chain]["name"]
-    emoji = "⛓️" if chain == "evm" else CHAINS[chain]["emoji"]
-
-    await message.answer(
-        f"✅ <b>Address Added</b>\n\n"
-        f"{emoji} <b>Chain:</b> {chain_name}\n"
-        f"<b>📍 Address:</b> <code>{address}</code>\n"
-        f"<b>🏷️ Label:</b> {label or 'N/A'}\n\n"
-        f"You will now receive real-time alerts for <b>all tokens</b> on this chain.",
+    await db.execute("INSERT INTO addresses (chat_id, address, chain, label) VALUES (?,?,?,?)", (cid, addr, chain, label))
+    name = "All EVM" if chain == "evm" else (cfg.name if cfg else chain)
+    emoji = "⛓️" if chain == "evm" else (cfg.emoji if cfg else "⬜")
+    await reply_del(
+        msg,
+        f"✅ <b>Added</b>\n\n{emoji} <b>{name}</b>\n"
+        f"<b>📍</b> <code>{addr}</code>\n"
+        f"<b>🏷️</b> {label}\n\n"
+        f"Alerts active for all tokens on this chain.",
         parse_mode=ParseMode.HTML,
     )
-
 
 # ── /rename ────────────────────────────────────────
 
-@router.message(Command("rename"))
-async def cmd_rename(message: types.Message):
-    parts = message.text.split(maxsplit=3)
+@router.message(Command("rename", "label"))
+async def cmd_rename(msg: types.Message):
+    parts = msg.text.split(maxsplit=3)
     if len(parts) < 4:
-        await message.answer(
-            "❌ Usage: <code>/rename &lt;chain&gt; &lt;address&gt; &lt;new label&gt;</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        await reply_del(msg, "❌ <code>/rename &lt;chain&gt; &lt;address&gt; &lt;label&gt;</code>", parse_mode=ParseMode.HTML)
         return
-    chain_input, address, label = parts[1].lower().strip(), parts[2].strip(), parts[3].strip()
-    chain = "evm" if chain_input in CHAINS and CHAINS[chain_input].get("type") == "evm" else chain_input
-    if not label or len(label) > 80:
-        await message.answer("❌ Label must contain 1–80 characters.", parse_mode=ParseMode.HTML)
+    chain_in = CHAIN_ALIASES.get(parts[1].lower(), parts[1].lower())
+    chain = "evm" if chain_in in CHAINS_BY_KEY and CHAINS_BY_KEY[chain_in].type == "evm" else chain_in
+    addr = parts[2].strip().lower()
+    label = html.escape(parts[3].strip(), quote=False)
+    if len(label) > 80:
+        await reply_del(msg, "❌ Label max 80 chars.", parse_mode=ParseMode.HTML)
         return
-    # Sanitize once at the boundary -- see /add for why this matters.
-    label = html_lib.escape(label, quote=False)
-    cur = await db.execute(
-        "UPDATE addresses SET label=? WHERE chat_id=? AND chain=? AND LOWER(address)=?",
-        (label, message.chat.id, chain, address.lower()),
-    )
+    cur = await db.execute("UPDATE addresses SET label=? WHERE chat_id=? AND chain=? AND address=? COLLATE NOCASE", (label, msg.chat.id, chain, addr))
     if cur.rowcount:
-        await message.answer(f"✅ Label updated to <b>{label}</b>.", parse_mode=ParseMode.HTML)
+        await reply_del(msg, f"✅ Label: <b>{label}</b>", parse_mode=ParseMode.HTML)
     else:
-        await message.answer("❌ Address not found. Check <code>/list</code>.", parse_mode=ParseMode.HTML)
+        await reply_del(msg, "❌ Not found. Check <code>/list</code>.", parse_mode=ParseMode.HTML)
 
+# ── /test ──────────────────────────────────────────
 
 @router.message(Command("test"))
-async def cmd_test(message: types.Message):
-    chat_id = message.chat.id
-    sample_cfg = CHAINS["base"]
-    # Mirrors BaseMonitor._notify()'s exact template, so this doubles as a
-    # real check that HTML formatting, emoji, and links render correctly --
-    # not just that *a* message can be sent.
+async def cmd_test(msg: types.Message):
+    cid = msg.chat.id
+    cfg = CHAINS_BY_KEY["base"]
     sample = (
-        f"<b>⬇️ Incoming Native Transfer</b>\n\n"
-        f"<b>{sample_cfg['emoji']} {sample_cfg['name']}</b>\n"
+        f"<b>🟢 IN Incoming Native Transfer</b>\n\n"
+        f"<b>{cfg.emoji} {cfg.name}</b>\n"
         f"<b>💰 Amount:</b> <code>0.05 ETH</code>\n"
-        f"<b>📤 From:</b> <code>0x000000000000000000000000000000000000dEaD</code>\n"
-        f"<b>📥 To:</b> <code>0xYourWalletAddressHere00000000000000</code> <i>(Sample)</i>\n"
+        f"<b>📤 From:</b> <code>0xA1B2...G7H8</code>\n"
+        f"<b>📥 To:</b> <code>0xYourWallet...</code> <i>(Sample)</i>\n"
         f"<b>📦 Block:</b> <code>0</code>\n"
-        f"<b>🔗 Tx:</b> <code>0xsample000000000000000000000000000000000000000000000000000000</code>\n"
-        f"<b>⏰ Time:</b> <code>{fmt_time(db, chat_id)}</code>"
+        f"<b>🔗 Tx:</b> <code>0xsample...</code>\n"
+        f"<b>⏰ Time:</b> <code>{await tz_helper.fmt(cid)}</code>"
     )
-    await message.answer(
-        "✅ <b>This is a sample alert</b> — it is NOT a real transfer.\n\n" + sample +
-        "\n\n<i>If this rendered cleanly, Telegram delivery is working. "
-        "Real alerts fire automatically when a monitored wallet moves funds — "
-        "check /status to confirm the relevant chain is online and /list to "
-        "confirm the address is actually being watched.</i>",
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+    await reply_del(
+        msg,
+        f"✅ <b>Sample Alert</b> (not real)\n\n{sample}\n\n"
+        f"<i>If clean, Telegram delivery works. Check /status for chain health.</i>",
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
     )
 
+# ── /remove ────────────────────────────────────────
 
 @router.message(Command("remove"))
-async def cmd_remove(message: types.Message):
-    parts = message.text.split(maxsplit=2)
+async def cmd_remove(msg: types.Message):
+    parts = msg.text.split(maxsplit=2)
     if len(parts) < 3:
-        chat_id = message.chat.id
-        rows = await db.fetchall(
-            "SELECT id, chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain",
-            (chat_id,),
-        )
+        cid = msg.chat.id
+        rows = await db.fetchall("SELECT id, chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain", (cid,))
         if not rows:
-            await message.answer("📭 No addresses to remove.", parse_mode=ParseMode.HTML)
+            await reply_del(msg, "📭 Nothing to remove.", parse_mode=ParseMode.HTML)
             return
-        buttons = []
+        btns = []
         for r in rows:
-            cfg = CHAINS.get(r["chain"], {})
-            emoji = "⛓️" if r["chain"] == "evm" else cfg.get("emoji", "⬜")
+            cfg = CHAINS_BY_KEY.get(r["chain"])
+            emoji = "⛓️" if r["chain"] == "evm" else (cfg.emoji if cfg else "⬜")
             lab = r["label"] or "No Label"
             short = f"{r['address'][:8]}...{r['address'][-4:]}"
-            buttons.append([InlineKeyboardButton(
-                text=f"{emoji} {short} ({lab})",
-                callback_data=f"remove_{r['id']}"
-            )])
-        buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="menu_back")])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await message.answer(
-            "<b>🗑️ Tap an address to remove:</b>\n\n"
-            "Or use: <code>/remove &lt;chain&gt; &lt;address&gt;</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
+            btns.append([InlineKeyboardButton(text=f"{emoji} {short} ({lab})", callback_data=f"rm_{r['id']}")])
+        btns.append([InlineKeyboardButton(text="❌ Cancel", callback_data="m_back")])
+        await msg.answer("<b>🗑️ Tap to remove:</b>\n\nOr: <code>/remove &lt;chain&gt; &lt;address&gt;</code>",
+                         parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
         return
 
-    chain_input = parts[1].lower().strip()
-    chain_input = CHAIN_ALIASES.get(chain_input, chain_input)
-    address = parts[2].strip().lower()
-    chain = "evm" if chain_input in CHAINS and CHAINS[chain_input].get("type") == "evm" else chain_input
-    chat_id = message.chat.id
-    cur = await db.execute(
-        "DELETE FROM addresses WHERE chat_id=? AND chain=? AND LOWER(address)=?",
-        (chat_id, chain, address),
-    )
+    chain_in = CHAIN_ALIASES.get(parts[1].lower(), parts[1].lower())
+    chain = "evm" if chain_in in CHAINS_BY_KEY and CHAINS_BY_KEY[chain_in].type == "evm" else chain_in
+    addr = parts[2].strip().lower()
+    cid = msg.chat.id
+    cur = await db.execute("DELETE FROM addresses WHERE chat_id=? AND chain=? AND address=? COLLATE NOCASE", (cid, chain, addr))
     if cur.rowcount:
-        name = "All EVM" if chain == "evm" else CHAINS.get(chain, {}).get("name", chain)
-        await message.answer(f"✅ Removed <code>{address}</code> from {name} monitoring.", parse_mode=ParseMode.HTML)
+        name = "All EVM" if chain == "evm" else (CHAINS_BY_KEY[chain].name if chain in CHAINS_BY_KEY else chain)
+        await reply_del(msg, f"✅ Removed from {name}.", parse_mode=ParseMode.HTML)
     else:
-        await message.answer("❌ Address not found in your list.", parse_mode=ParseMode.HTML)
+        await reply_del(msg, "❌ Not found.", parse_mode=ParseMode.HTML)
 
-
-@router.callback_query(F.data.startswith("remove_"))
-async def cb_remove_id(callback: types.CallbackQuery):
-    addr_id = int(callback.data.split("_")[1])
-    chat_id = callback.message.chat.id
-    row = await db.fetchone("SELECT chain, address FROM addresses WHERE id=? AND chat_id=?", (addr_id, chat_id))
+@router.callback_query(F.data.startswith("rm_"))
+async def cb_rm(cb: types.CallbackQuery):
+    aid = int(cb.data.split("_")[1])
+    cid = cb.message.chat.id
+    row = await db.fetchone("SELECT address FROM addresses WHERE id=? AND chat_id=?", (aid, cid))
     if not row:
-        await callback.answer("Already removed", show_alert=True)
+        await cb.answer("Already removed", show_alert=True)
         return
-    await db.execute("DELETE FROM addresses WHERE id=? AND chat_id=?", (addr_id, chat_id))
-    await callback.message.edit_text(
-        f"✅ Removed <code>{row['address']}</code> from monitoring.",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer("Removed successfully")
-
+    await db.execute("DELETE FROM addresses WHERE id=? AND chat_id=?", (aid, cid))
+    await cb.message.edit_text(f"✅ Removed <code>{row['address']}</code>.", parse_mode=ParseMode.HTML)
+    await cb.answer("Removed")
 
 # ── /list ──────────────────────────────────────────
 
 @router.message(Command("list"))
-async def cmd_list(message: types.Message):
-    chat_id = message.chat.id
-    parts = message.text.split()
-    chain_filter = CHAIN_ALIASES.get(parts[1].lower(), parts[1].lower()) if len(parts) > 1 else None
-    if chain_filter and chain_filter in CHAINS and CHAINS[chain_filter].get("type") == "evm":
-        chain_filter = "evm"
-    if chain_filter and chain_filter not in CHAINS:
-        await message.answer("❌ Unknown chain. Use <code>/chains</code>.", parse_mode=ParseMode.HTML)
+async def cmd_list(msg: types.Message):
+    cid = msg.chat.id
+    parts = msg.text.split()
+    filt = CHAIN_ALIASES.get(parts[1].lower(), parts[1].lower()) if len(parts) > 1 else None
+    if filt and filt in CHAINS_BY_KEY and CHAINS_BY_KEY[filt].type == "evm":
+        filt = "evm"
+    if filt and filt not in CHAINS_BY_KEY and filt != "evm":
+        await reply_del(msg, "❌ Unknown chain. Use /chains.", parse_mode=ParseMode.HTML)
         return
-    if chain_filter:
-        rows = await db.fetchall(
-            "SELECT chain, address, label FROM addresses WHERE chat_id=? AND chain=? ORDER BY chain, created_at",
-            (chat_id, chain_filter),
-        )
-    else:
-        rows = await db.fetchall(
-            "SELECT chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain, created_at",
-            (chat_id,),
-        )
+    sql = "SELECT chain, address, label FROM addresses WHERE chat_id=?" + (" AND chain=?" if filt else "") + " ORDER BY chain"
+    params = (cid, filt) if filt else (cid,)
+    rows = await db.fetchall(sql, params)
     if not rows:
-        await message.answer(
-            "📭 No addresses monitored.\nUse <code>/add &lt;chain&gt; &lt;address&gt; [label]</code> to start.",
-            parse_mode=ParseMode.HTML,
-        )
+        await reply_del(msg, "📭 No addresses. Use <code>/add</code>.", parse_mode=ParseMode.HTML)
         return
-    text = "<b>📋 Your Monitored Addresses</b>\n\n"
-    current = ""
+    text = "<b>📋 Your Addresses</b>\n\n"
+    cur = ""
     for r in rows:
-        if r["chain"] != current:
-            current = r["chain"]
-            cfg = CHAINS.get(current, {})
-            emoji = "⛓️" if current == "evm" else cfg.get("emoji", "⬜")
-            name = "All EVM Chains" if current == "evm" else cfg.get("name", current)
+        if r["chain"] != cur:
+            cur = r["chain"]
+            cfg = CHAINS_BY_KEY.get(cur)
+            emoji = "⛓️" if cur == "evm" else (cfg.emoji if cfg else "⬜")
+            name = "All EVM" if cur == "evm" else (cfg.name if cfg else cur)
             text += f"\n{emoji} <b>{name}</b>\n"
-        a = r["address"]
-        lab = r["label"] or "No Label"
-        # Full address, not truncated: a "..." in a <code> block is not
-        # copyable into a wallet or explorer, which defeats the point.
-        text += f"  ├ <code>{a}</code> — <i>{lab}</i>\n"
-    count = len(rows)
-    text += f"\n<i>Total: {count} address(es) monitored</i>"
-    await send_long(message, text, parse_mode=ParseMode.HTML)
-
+        text += f"  ├ <code>{r['address']}</code> — <i>{r['label'] or 'No Label'}</i>\n"
+    text += f"\n<i>Total: {len(rows)}</i>"
+    await send_long(msg, text, parse_mode=ParseMode.HTML)
 
 # ── /history ───────────────────────────────────────
 
 @router.message(Command("history"))
-async def cmd_history(message: types.Message):
-    chat_id = message.chat.id
-    parts = message.text.split(maxsplit=1)
+async def cmd_history(msg: types.Message):
+    cid = msg.chat.id
+    parts = msg.text.split(maxsplit=1)
     limit = 10
     if len(parts) > 1:
         try:
-            limit = max(1, min(int(parts[1]), 50))
+            limit = max(1, min(int(parts[1]), Config.MAX_HISTORY))
         except ValueError:
-            await message.answer(
-                "❌ Usage: <code>/history [1-50]</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            await reply_del(msg, "❌ <code>/history [1-50]</code>", parse_mode=ParseMode.HTML)
             return
-
     rows = await db.fetchall(
-        "SELECT chain, tx_hash, asset, amount, memo, created_at FROM notifications "
-        "WHERE chat_id=? ORDER BY created_at DESC LIMIT ?",
-        (chat_id, limit),
+        "SELECT chain, tx_hash, asset, amount, direction, notification_timezone, contract_addr, created_at FROM notifications "
+        "WHERE chat_id=? ORDER BY created_at DESC LIMIT ?", (cid, limit)
     )
     if not rows:
-        await message.answer(
-            "📭 <b>No history yet.</b>\n\n"
-            "Notifications will appear here once you receive transfers.\n"
-            "Make sure you've added addresses with <code>/add</code>.",
-            parse_mode=ParseMode.HTML,
-        )
+        await reply_del(msg, "📭 No history. Add addresses with <code>/add</code>.", parse_mode=ParseMode.HTML)
         return
-
     text = f"<b>📜 Last {len(rows)} Notifications</b>\n\n"
     for i, r in enumerate(rows, 1):
-        cfg = CHAINS.get(r["chain"], {})
-        emoji = cfg.get("emoji", "⬜")
-        tx_short = r["tx_hash"]
+        cfg = CHAINS_BY_KEY.get(r["chain"])
+        badge = "🔴 OUT" if r["direction"] == "outgoing" else "🟢 IN"
         dt = datetime.fromisoformat(r["created_at"])
-        time_str = fmt_time(db, chat_id, dt)
-        text += (
-            f"{i}. {emoji} <code>{r['asset']}</code> | <code>{r['amount']}</code>\n"
-            f"   └ <a href='{cfg.get('explorer', '')}{r['tx_hash']}'>{tx_short}</a> | {time_str}\n\n"
-        )
-    await send_long(message, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
+        ts = await tz_helper.fmt(cid, dt, stored_tz=r["notification_timezone"])
+        text += f"{i}. {badge} {cfg.emoji if cfg else '⬜'} <code>{r['asset']}</code> | <code>{r['amount']}</code>\n   └ <a href='{(cfg.explorer if cfg else '')}{r['tx_hash']}'>{r['tx_hash']}</a> | {ts}\n\n"
+    await send_long(msg, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 # ── /clearhistory ──────────────────────────────────
 
 @router.message(Command("clearhistory"))
-async def cmd_clearhistory(message: types.Message):
-    chat_id = message.chat.id
+async def cmd_clr(msg: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Yes, clear all", callback_data="clear_history_confirm"),
-         InlineKeyboardButton(text="❌ Cancel", callback_data="menu_settings")]
+        [InlineKeyboardButton(text="✅ Yes, clear", callback_data="clr_conf"),
+         InlineKeyboardButton(text="❌ Cancel", callback_data="m_set")]
     ])
-    await message.answer(
-        "🗑️ <b>Clear History?</b>\n\n"
-        "This will delete all your notification history.\n"
-        "Your monitored addresses will NOT be affected.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
+    await msg.answer("🗑️ <b>Clear History?</b>\n\nThis deletes all notification history.\nAddresses are NOT affected.",
+                     parse_mode=ParseMode.HTML, reply_markup=kb)
 
+# ── /pause / resume ────────────────────────────────
+
+@router.message(Command("pause"))
+async def cmd_pause(msg: types.Message):
+    await db.execute("UPDATE users SET notifications_enabled=0 WHERE chat_id=?", (msg.chat.id,))
+    notifier._user_cache.pop(msg.chat.id, None)
+    await reply_del(msg, "🔕 <b>Paused.</b> Use <code>/resume</code> to re-enable.", parse_mode=ParseMode.HTML)
+
+@router.message(Command("resume"))
+async def cmd_resume(msg: types.Message):
+    await db.execute("UPDATE users SET notifications_enabled=1 WHERE chat_id=?", (msg.chat.id,))
+    notifier._user_cache.pop(msg.chat.id, None)
+    await reply_del(msg, "🔔 <b>Resumed.</b>", parse_mode=ParseMode.HTML)
 
 # ── /timezone ──────────────────────────────────────
 
-@router.message(Command("pause"))
-async def cmd_pause(message: types.Message):
-    await db.execute("UPDATE users SET notifications_enabled=0 WHERE chat_id=?", (message.chat.id,))
-    await message.answer(
-        "🔕 <b>Notifications paused.</b>\n\nYour addresses remain monitored. Use <code>/resume</code> to receive alerts again.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(Command("resume"))
-async def cmd_resume(message: types.Message):
-    await db.execute("UPDATE users SET notifications_enabled=1 WHERE chat_id=?", (message.chat.id,))
-    await message.answer(
-        "🔔 <b>Notifications resumed.</b>\n\nYou will receive alerts for your monitored addresses.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
 @router.message(Command("timezone"))
-async def cmd_timezone(message: types.Message):
-    chat_id = message.chat.id
-    parts = message.text.split(maxsplit=1)
-
+async def cmd_tz(msg: types.Message):
+    cid = msg.chat.id
+    parts = msg.text.split(maxsplit=1)
     if len(parts) == 1:
-        row = await db.fetchone("SELECT timezone FROM users WHERE chat_id=?", (chat_id,))
-        current = row["timezone"] if row and row["timezone"] else "UTC"
-        quick = "\n".join(f"  <code>{tz}</code>" for tz in POPULAR_TZS)
-        await message.answer(
-            f"<b>🌍 Your Timezone</b>\n\n"
-            f"Current: <code>{current}</code>\n\n"
-            f"<b>Quick picks:</b>\n{quick}\n\n"
-            f"Or set any IANA timezone:\n<code>/timezone Europe/Paris</code>",
-            parse_mode=ParseMode.HTML,
+        cur = await tz_helper.get(cid)
+        quick = "\n".join(f"  <code>{t}</code>" for t in POPULAR_TZS)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🌍 {t}", callback_data=f"tz_{t}")] for t in POPULAR_TZS[:6]
+        ] + [[InlineKeyboardButton(text="🌍 More...", callback_data="m_tz")]])
+        await msg.answer(
+            f"<b>🌍 Timezone</b>\n\nCurrent: <code>{cur}</code>\n\n<b>Quick picks:</b>\n{quick}\n\n"
+            f"Or: <code>/timezone Europe/Paris</code>",
+            parse_mode=ParseMode.HTML, reply_markup=kb,
         )
         return
-
-    tz_input = parts[1].strip()
-    if tz_input not in available_timezones():
-        await message.answer(
-            f"❌ Invalid timezone: <code>{tz_input}</code>\n\n"
-            f"Use an IANA timezone like <code>Asia/Kolkata</code> or <code>America/New_York</code>.",
-            parse_mode=ParseMode.HTML,
-        )
+    tz_in = parts[1].strip()
+    if tz_in not in available_timezones():
+        await reply_del(msg, f"❌ Invalid: <code>{tz_in}</code>\nUse IANA format like <code>Asia/Kolkata</code>.", parse_mode=ParseMode.HTML)
         return
-
-    await db.execute("UPDATE users SET timezone=? WHERE chat_id=?", (tz_input, chat_id))
-    sample = datetime.now(ZoneInfo(tz_input)).strftime("%Y-%m-%d %H:%M:%S %Z")
-    await message.answer(
-        f"✅ <b>Timezone Updated</b>\n\n"
-        f"<b>New timezone:</b> <code>{tz_input}</code>\n"
-        f"<b>Sample time:</b> <code>{sample}</code>\n\n"
-        f"All future notifications will use this timezone.",
-        parse_mode=ParseMode.HTML,
-    )
-
+    await db.execute("UPDATE users SET timezone=? WHERE chat_id=?", (tz_in, cid))
+    tz_helper.invalidate(cid)
+    sample = datetime.now(ZoneInfo(tz_in)).strftime("%Y-%m-%d %H:%M:%S %Z")
+    await reply_del(msg, f"✅ <b>Timezone: {tz_in}</b>\nSample: <code>{sample}</code>", parse_mode=ParseMode.HTML)
 
 # ── /stats ─────────────────────────────────────────
 
-async def build_status_text(chat_id: int) -> str:
-    preference = await db.fetchone("SELECT notifications_enabled FROM users WHERE chat_id=?", (chat_id,))
-    address_row = await db.fetchone("SELECT COUNT(*) AS c FROM addresses WHERE chat_id=?", (chat_id,))
-    notification_row = await db.fetchone(
-        "SELECT COUNT(*) AS c FROM notifications WHERE chat_id=? AND created_at > datetime('now', '-1 day')",
-        (chat_id,),
-    )
-    latest = await db.fetchone(
-        "SELECT chain, asset, amount, created_at FROM notifications WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
-        (chat_id,),
-    )
-    uptime = "not started"
-    if app_started_at:
-        seconds = max(0, int((datetime.now() - app_started_at).total_seconds()))
-        uptime = f"{seconds // 3600}h {(seconds % 3600) // 60}m"
-    online_count = sum(
-        1 for monitor in active_monitors.values()
-        if monitor.running and (monitor.cfg.get("type") != "evm" or monitor.w3 is not None)
-    )
-    offline_count = max(0, len(active_monitors) - online_count)
-    monitored = [
-        (key, monitor.running)
-        for key, monitor in active_monitors.items()
-        if await db.fetchone("SELECT 1 FROM addresses WHERE chat_id=? AND chain=? LIMIT 1", (chat_id, key))
-        or (monitor.cfg.get("type") == "evm" and await db.fetchone("SELECT 1 FROM addresses WHERE chat_id=? AND chain='evm' LIMIT 1", (chat_id,)))
-    ]
-    lines = [
-        "<b>📊 Monitor Status</b>",
-        "",
-        f"<b>Addresses:</b> <code>{address_row['c']}</code>",
-        f"<b>Alerts (24h):</b> <code>{notification_row['c']}</code>",
-        f"<b>Notifications:</b> <code>{'ON' if not preference or preference['notifications_enabled'] else 'PAUSED'}</code>",
-        f"<b>Networks configured:</b> <code>{len(CHAINS)}</code>",
-        f"<b>Network health:</b> <code>{online_count} online</code> / <code>{offline_count} reconnecting</code>",
-        f"<b>Bot uptime:</b> <code>{uptime}</code>",
-        "",
-    ]
-    if latest:
-        lines.append(f"<b>Latest alert:</b> <code>{latest['amount']} {latest['asset']}</code> ({latest['chain']})")
-    if monitored:
-        lines.append("<b>Your active networks:</b>")
-        for key, running in monitored:
-            cfg = CHAINS[key]
-            monitor = active_monitors[key]
-            connected = cfg.get("type") != "evm" or monitor.w3 is not None
-            state = "🟢 polling" if running and connected else "🔴 reconnecting"
-            lines.append(f"{cfg['emoji']} <b>{cfg['name']}</b>: {state}")
-    else:
-        lines.append("<i>No addresses are being monitored yet.</i>")
-    return "\n".join(lines)
-
-
-@router.message(Command("status"))
-async def cmd_status(message: types.Message):
-    await message.answer(await build_status_text(message.chat.id), parse_mode=ParseMode.HTML)
-
-
-@router.message(Command("report", "wallets"))
-async def cmd_wallet_report(message: types.Message):
-    chat_id = message.chat.id
-    rows = await db.fetchall(
-        "SELECT chain, address, label, created_at FROM addresses WHERE chat_id=? ORDER BY chain, created_at",
-        (chat_id,),
-    )
-    if not rows:
-        await message.answer(
-            "📭 <b>No wallets configured.</b>\nUse <code>/add &lt;chain&gt; &lt;address&gt; [label]</code> to begin.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    text = "<b>👛 Wallet Report</b>\n\n"
-    current_chain = None
-    for row in rows:
-        chain = row["chain"]
-        if chain != current_chain:
-            current_chain = chain
-            cfg = CHAINS.get(chain, {})
-            chain_count = await db.fetchone(
-                "SELECT COUNT(*) AS c FROM addresses WHERE chat_id=? AND chain=?", (chat_id, chain)
-            )
-            text += f"<b>{cfg.get('emoji', '⛓️')} {cfg.get('name', chain)}</b> — {chain_count['c']} wallet(s)\n"
-        alert_count = await db.fetchone(
-            "SELECT COUNT(*) AS c FROM notifications WHERE chat_id=? AND chain=?",
-            (chat_id, chain),
-        )
-        short = row["address"]
-        text += f"  <code>{short}</code> — <i>{row['label'] or 'No label'}</i> — {alert_count['c']} alert(s)\n"
-    text += "\n<i>Use /list for addresses or /rename to update labels.</i>"
-    await send_long(message, text, parse_mode=ParseMode.HTML)
-
-
 @router.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    chat_id = message.chat.id
-    addr_count = await db.fetchone("SELECT COUNT(*) as c FROM addresses WHERE chat_id=?", (chat_id,))
-    notif_count = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=?", (chat_id,))
-    notif_24h = await db.fetchone(
-        "SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND created_at > datetime('now', '-1 day')",
-        (chat_id,),
-    )
-    row = await db.fetchone("SELECT timezone FROM users WHERE chat_id=?", (chat_id,))
-    tz = row["timezone"] if row and row["timezone"] else "UTC"
-
-    # Chain breakdown
-    chain_rows = await db.fetchall(
-        "SELECT chain, COUNT(*) as c FROM addresses WHERE chat_id=? GROUP BY chain",
-        (chat_id,),
-    )
-    chain_breakdown = "\n".join(
-        f"  {CHAINS.get(r['chain'], {}).get('emoji', '⬜')} {CHAINS.get(r['chain'], {}).get('name', r['chain'])}: <code>{r['c']}</code>"
-        for r in chain_rows
-    )
-
-    await message.answer(
-        f"<b>📊 Your Stats</b>\n\n"
-        f"<b>📬 Total Addresses:</b> <code>{addr_count['c']}</code>\n"
-        f"<b>🔔 Total Notifications:</b> <code>{notif_count['c']}</code>\n"
-        f"<b>📈 Last 24h:</b> <code>{notif_24h['c']}</code>\n"
+async def cmd_stats(msg: types.Message):
+    cid = msg.chat.id
+    ac = await db.fetchone("SELECT COUNT(*) as c FROM addresses WHERE chat_id=?", (cid,))
+    nc = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=?", (cid,))
+    n24 = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND created_at > datetime('now', '-1 day')", (cid,))
+    inn = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND direction='incoming'", (cid,))
+    out = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND direction='outgoing'", (cid,))
+    tz = await tz_helper.get(cid)
+    cbreak = await db.fetchall("SELECT chain, COUNT(*) as c FROM addresses WHERE chat_id=? GROUP BY chain", (cid,))
+    ctext = "\n".join(f"  {CHAINS_BY_KEY.get(r['chain'], ChainCfg(r['chain'], r['chain'], '⬜', '', '', 0)).emoji} {CHAINS_BY_KEY.get(r['chain'], ChainCfg(r['chain'], r['chain'], '⬜', '', '', 0)).name}: <code>{r['c']}</code>" for r in cbreak)
+    await reply_del(
+        msg,
+        f"<b>📊 Stats</b>\n\n"
+        f"<b>📬 Addresses:</b> <code>{ac['c']}</code>\n"
+        f"<b>🔔 Notifications:</b> <code>{nc['c']}</code>\n"
+        f"  ├ 🟢 IN: <code>{inn['c']}</code>\n"
+        f"  └ 🔴 OUT: <code>{out['c']}</code>\n"
+        f"<b>📈 24h:</b> <code>{n24['c']}</code>\n"
         f"<b>🌍 Timezone:</b> <code>{tz}</code>\n\n"
-        f"<b>By Chain:</b>\n{chain_breakdown}",
+        f"<b>By Chain:</b>\n{ctext}",
         parse_mode=ParseMode.HTML,
     )
 
+# ── /status ────────────────────────────────────────
+
+@router.message(Command("status"))
+async def cmd_status(msg: types.Message):
+    cid = msg.chat.id
+    pref = await db.get_user_prefs(cid)
+    ac = await db.fetchone("SELECT COUNT(*) as c FROM addresses WHERE chat_id=?", (cid,))
+    n24 = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND created_at > datetime('now', '-1 day')", (cid,))
+    in24 = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND direction='incoming' AND created_at > datetime('now', '-1 day')", (cid,))
+    out24 = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND direction='outgoing' AND created_at > datetime('now', '-1 day')", (cid,))
+    latest = await db.fetchone("SELECT chain, asset, amount, direction, created_at FROM notifications WHERE chat_id=? ORDER BY created_at DESC LIMIT 1", (cid,))
+    uptime = "not started"
+    if app_start:
+        s = max(0, int((datetime.now() - app_start).total_seconds()))
+        uptime = f"{s // 3600}h {(s % 3600) // 60}m"
+    online = sum(1 for m in monitors.values() if m.running and (getattr(m, "_w3", True) is not None))
+    offline = max(0, len(monitors) - online)
+
+    text = (
+        f"<b>📊 Status</b>\n\n"
+        f"<b>Addresses:</b> <code>{ac['c']}</code>\n"
+        f"<b>Alerts (24h):</b> <code>{n24['c']}</code>\n"
+        f"  IN: <code>{in24['c']}</code> | OUT: <code>{out24['c']}</code>\n"
+        f"<b>Notifications:</b> <code>{'ON' if pref['enabled'] else 'PAUSED'}</code>\n"
+        f"<b>Networks:</b> <code>{len(_CHAINS)}</code>\n"
+        f"<b>Health:</b> <code>{online} online</code> / <code>{offline} reconnecting</code>\n"
+        f"<b>Uptime:</b> <code>{uptime}</code>\n"
+    )
+    if latest:
+        badge = "🔴 OUT" if latest["direction"] == "outgoing" else "🟢 IN"
+        text += f"\n<b>Latest:</b> {badge} <code>{latest['amount']} {latest['asset']}</code> ({latest['chain']})\n"
+    user_chains = set(r["chain"] for r in await db.fetchall("SELECT DISTINCT chain FROM addresses WHERE chat_id=?", (cid,)))
+    if "evm" in user_chains:
+        user_chains.update(EVM_KEYS)
+    if user_chains:
+        text += "\n<b>Your networks:</b>\n"
+        for k in sorted(user_chains):
+            cfg = CHAINS_BY_KEY.get(k)
+            if not cfg:
+                continue
+            m = monitors.get(k)
+            state = "🟢 polling" if m and m.running and (getattr(m, "_w3", True) is not None) else "🔴 reconnecting"
+            text += f"{cfg.emoji} <b>{cfg.name}</b>: {state}\n"
+    else:
+        text += "\n<i>No addresses monitored yet.</i>"
+    await msg.answer(text, parse_mode=ParseMode.HTML)
+
+# ── /report ────────────────────────────────────────
+
+@router.message(Command("report", "wallets"))
+async def cmd_report(msg: types.Message):
+    cid = msg.chat.id
+    rows = await db.fetchall("SELECT chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain", (cid,))
+    if not rows:
+        await reply_del(msg, "📭 No wallets. Use <code>/add</code>.", parse_mode=ParseMode.HTML)
+        return
+    text = "<b>👛 Wallet Report</b>\n\n"
+    cur = None
+    for r in rows:
+        if r["chain"] != cur:
+            cur = r["chain"]
+            cfg = CHAINS_BY_KEY.get(cur)
+            cc = await db.fetchone("SELECT COUNT(*) as c FROM addresses WHERE chat_id=? AND chain=?", (cid, cur))
+            text += f"<b>{cfg.emoji if cfg else '⛓️'} {cfg.name if cfg else cur}</b> — {cc['c']} wallet(s)\n"
+        inn = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND chain=? AND direction='incoming'", (cid, cur))
+        out = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE chat_id=? AND chain=? AND direction='outgoing'", (cid, cur))
+        text += f"  <code>{r['address']}</code> — <i>{r['label'] or 'No label'}</i> — 🟢{inn['c']} / 🔴{out['c']}\n"
+    text += "\n<i>Use /list or /rename.</i>"
+    await send_long(msg, text, parse_mode=ParseMode.HTML)
 
 # ── /export ────────────────────────────────────────
 
 @router.message(Command("export"))
-async def cmd_export(message: types.Message):
-    chat_id = message.chat.id
-    rows = await db.fetchall(
-        "SELECT chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain, created_at",
-        (chat_id,),
-    )
+async def cmd_export(msg: types.Message):
+    cid = msg.chat.id
+    rows = await db.fetchall("SELECT chain, address, label FROM addresses WHERE chat_id=? ORDER BY chain", (cid,))
     if not rows:
-        await message.answer("📭 No addresses to export.", parse_mode=ParseMode.HTML)
+        await reply_del(msg, "📭 Nothing to export.", parse_mode=ParseMode.HTML)
         return
-
-    lines = ["# telegram-multichain-monitor Export", f"# User: {chat_id}", f"# Exported: {fmt_time(db, chat_id)}", ""]
+    lines = ["# Multi-Chain Monitor Export", f"# User: {cid}", f"# Time: {await tz_helper.fmt(cid)}", ""]
     for r in rows:
-        cfg = CHAINS.get(r["chain"], {})
-        name = "EVM" if r["chain"] == "evm" else cfg.get("name", r["chain"])
+        cfg = CHAINS_BY_KEY.get(r["chain"])
+        name = "EVM" if r["chain"] == "evm" else (cfg.name if cfg else r["chain"])
         lines.append(f"[{name}] {r['address']}  # {r['label'] or 'No Label'}")
-
     text = "\n".join(lines)
-    header = "<b>📤 Export</b>\n\n"
-    footer = "\n\n<i>Copy the text above to back up your addresses.</i>"
-    wrapper_overhead = len(header) + len(footer) + len("<pre></pre>")
-    # Chunk the raw lines first, then wrap each chunk in its own <pre> tags --
-    # splitting an already-wrapped block would leave an unmatched <pre>/</pre>
-    # in whichever message got cut, breaking HTML parsing for that message.
-    line_chunks = _chunk_text(text, limit=TELEGRAM_MAX_LEN - wrapper_overhead)
-    for i, chunk in enumerate(line_chunks):
-        piece = f"<pre>{chunk}</pre>"
-        if i == 0:
-            piece = header + piece
-        if i == len(line_chunks) - 1:
-            piece = piece + footer
-        await message.answer(piece, parse_mode=ParseMode.HTML)
-
+    await msg.answer(f"<b>📤 Export</b>\n\n<pre>{text}</pre>\n\n<i>Copy to back up your addresses.</i>", parse_mode=ParseMode.HTML)
 
 # ── /chains ────────────────────────────────────────
 
 @router.message(Command("chains"))
-async def cmd_chains(message: types.Message):
-    evm_chains = [(k, c) for k, c in CHAINS.items() if c.get("type") == "evm"]
-    other_chains = [(k, c) for k, c in CHAINS.items() if c.get("type") != "evm"]
-
-    text = "<b>⛓️ Supported Chains</b>\n\n"
-    text += (
-        f"<b>⛓️ EVM</b> — add once with <code>/add evm &lt;address&gt;</code>, "
-        f"monitored across all {len(evm_chains)} networks below:\n"
+async def cmd_chains(msg: types.Message):
+    evm = [c for c in _CHAINS if c.type == "evm"]
+    other = [c for c in _CHAINS if c.type != "evm"]
+    text = (
+        f"<b>⛓️ Supported Chains ({len(_CHAINS)})</b>\n\n"
+        f"<b>⛓️ EVM</b> — add once, monitored across all {len(evm)} networks:\n"
+        f"{', '.join(f'{c.emoji} {c.name}' for c in evm)}\n"
+        f"<i>All ERC-20 tokens auto-detected.</i>\n\n"
+        f"<b>Other Networks:</b>\n"
     )
-    text += ", ".join(f"{c['emoji']} {c['name']}" for _, c in evm_chains) + "\n"
-    text += "<i>All ERC-20 tokens (USDT, USDC, etc.) detected automatically on each.</i>\n\n"
+    for c in other:
+        note = {"ton": "Native + All Jettons", "xlm": "Native + All Assets", "sol": "Native + All SPLs",
+                "tron": "Native + All TRC-20s", "btc": "Native BTC only", "sui": "Native + All Move Coins"}.get(c.key, "")
+        text += f"{c.emoji} <b>{c.name}</b> — <code>{c.key}</code> — <code>{c.native}</code> — <i>{note}</i>\n"
+    await send_long(msg, text, parse_mode=ParseMode.HTML)
 
-    text += "<b>Other networks</b> — add individually by key:\n"
-    for k, c in other_chains:
-        note = ""
-        if k == "ton": note = " — <i>Native + All Jettons</i>"
-        elif k == "xlm": note = " — <i>Native + All Assets</i>"
-        elif k == "sol": note = " — <i>Native + All SPLs</i>"
-        elif k == "tron": note = " — <i>Native + All TRC-20s</i>"
-        elif k == "btc": note = " — <i>Native BTC only</i>"
-        elif k == "sui": note = " — <i>Native + All Move Coins</i>"
-        text += f"{c['emoji']} <b>{c['name']}</b> — <code>{k}</code> — <code>{c['native']}</code>{note}\n"
-    await send_long(message, text, parse_mode=ParseMode.HTML)
+# ── Local project assistant ────────────────────────
+
+def local_project_answer_legacy(question: str) -> str:
+    """Unused legacy assistant implementation kept out of the router."""
+    q = question.casefold().strip()
+    chain_names = ", ".join(c.name for c in _CHAINS)
+
+    if any(word in q for word in ("chain", "network", "support")):
+        return (
+            f"<b>Supported networks ({len(_CHAINS)})</b>\n\n"
+            f"{html.escape(chain_names)}\n\n"
+            "Use <code>/chains</code> for the complete formatted list."
+        )
+    if any(word in q for word in ("add", "monitor", "wallet", "address")):
+        return (
+            "<b>Add a wallet</b>\n\n"
+            "<code>/add &lt;address&gt; [label]</code>\n"
+            "Example: <code>/add 0x1234... Main wallet</code>\n\n"
+            "For an ambiguous address, use "
+            "<code>/add &lt;chain&gt; &lt;address&gt; [label]</code>."
+        )
+    if any(word in q for word in ("label", "rename", "name")):
+        return (
+            "Use <code>/label &lt;chain&gt; &lt;address&gt; &lt;label&gt;</code> "
+            "to create or change a custom wallet label."
+        )
+    if any(word in q for word in ("incoming", "outgoing", "outbound", "in and out", "transaction")):
+        return (
+            "The monitor detects both incoming and outgoing activity. "
+            "ERC-20, native transfers, and supported chain token transfers "
+            "include the sender, recipient, amount, transaction link, and contract address when available."
+        )
+    if any(word in q for word in ("contract", "ca", "token address")):
+        return "Token alerts include the token contract address as <b>CA</b> when the network provides it."
+    if any(word in q for word in ("admin", "ban", "unban", "spam")):
+        return (
+            "Administrators can use <code>/admin</code>, <code>/admin_user &lt;chat_id&gt;</code>, "
+            "<code>/ban &lt;chat_id&gt;</code>, and <code>/unban &lt;chat_id&gt;</code>. "
+            "Anti-spam limits apply to regular users and never to admins."
+        )
+    if any(word in q for word in ("history", "status", "alert", "notification")):
+        return (
+            "Use <code>/history</code> for recent alerts, <code>/status</code> for monitor health, "
+            "and <code>/stats</code> for your activity totals."
+        )
+    if any(word in q for word in ("timezone", "time", "ist", "utc")):
+        return "Use <code>/timezone &lt;zone&gt;</code>, for example <code>/timezone Asia/Kolkata</code>."
+    if any(word in q for word in ("rpc", "backup", "fallback", "connection")):
+        return (
+            "EVM networks use multiple RPC endpoints with retry and backoff. "
+            "If one endpoint fails, the monitor tries its configured backups automatically."
+        )
+    if any(word in q for word in ("private key", "security", "safe", "privacy")):
+        return (
+            "This bot is read-only: it monitors public wallet addresses and never asks for or stores private keys. "
+            "Keep your <code>.env</code> file private."
+        )
+    return (
+        "I can answer questions about this project locally. Try:\n"
+        "<code>/ask how do I add a wallet?</code>\n"
+        "<code>/ask which networks are supported?</code>\n"
+        "<code>/ask how are incoming transfers detected?</code>"
+    )
+
+
+# Legacy handler intentionally not registered; the primary /ask handler is above.
+async def cmd_ask_legacy(msg: types.Message):
+    question = (msg.text or "").partition(" ")[2].strip()
+    if not question:
+        await reply_del(msg, "Usage: <code>/ask your question</code>", parse_mode=ParseMode.HTML)
+        return
+    await reply_del(msg, local_project_answer(question), parse_mode=ParseMode.HTML)
 
 
 # ── /help ──────────────────────────────────────────
 
 @router.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "<b>📖 Command Reference</b>\n\n"
-        "<b>➕ /add</b> <code>&lt;chain&gt; &lt;address&gt; [label]</code>\n"
-        "  └ Monitor a new address\n"
-        "<b>🗑️ /remove</b> <code>&lt;chain&gt; &lt;address&gt;</code>\n"
-        "  └ Stop monitoring (or tap to remove inline)\n"
-        "<b>✏️ /rename</b> <code>&lt;chain&gt; &lt;address&gt; &lt;label&gt;</code>\n"
-        "  └ Change an address's label\n"
-        "<b>📋 /list</b> [chain] — Show monitored addresses\n"
-        "<b>👛 /report</b> — Wallets with per-address alert counts\n"
-        "<b>📜 /history</b> [limit] — Show notification history (max 50)\n"
-        "<b>🗑️ /clearhistory</b> — Clear all history\n"
-        "<b>🔕 /pause</b> — Pause notifications\n"
-        "<b>🔔 /resume</b> — Resume notifications\n"
-        "<b>🌍 /timezone</b> <code>&lt;zone&gt;</code> — Set local timezone\n"
-        "<b>📊 /stats</b> — Your monitoring statistics\n"
-        "<b>📊 /status</b> — Monitor health and active networks\n"
-        "<b>🧪 /test</b> — Send a sample alert to check formatting/delivery\n"
-        "<b>📤 /export</b> — Export addresses as text\n"
-        "<b>⛓️ /chains</b> — List supported chains\n"
+async def cmd_help(msg: types.Message):
+    # /ask is also registered in Telegram's command menu.
+    await msg.answer(
+        "<b>📖 Commands</b>\n\n"
+        "<b>➕ /add</b> <code>&lt;addr&gt; [label]</code> — Auto-detects chain\n"
+        "<b>🗑️ /remove</b> <code>&lt;chain&gt; &lt;addr&gt;</code> — Or tap inline\n"
+        "<b>✏️ /rename</b> <code>&lt;chain&gt; &lt;addr&gt; &lt;label&gt;</code>\n"
+        "<b>📋 /list</b> [chain] — Show addresses\n"
+        "<b>👛 /report</b> — Per-wallet alert counts\n"
+        "<b>📜 /history</b> [limit] — History (max 50)\n"
+        "<b>🗑️ /clearhistory</b> — Clear history\n"
+        "<b>🔕 /pause</b> — Pause alerts\n"
+        "<b>🔔 /resume</b> — Resume alerts\n"
+        "<b>🌍 /timezone</b> <code>&lt;zone&gt;</code> — Set timezone\n"
+        "<b>📊 /stats</b> — Your statistics\n"
+        "<b>📊 /status</b> — Monitor health\n"
+        "<b>🧪 /test</b> — Sample alert\n"
+        "<b>📤 /export</b> — Export addresses\n"
+        "<b>⛓️ /chains</b> — List networks\n"
         "<b>❓ /help</b> — This message\n\n"
-        "<i>💡 EVM addresses monitor all 19 EVM chains simultaneously.</i>\n"
-        "<i>💡 All token types detected: ERC-20, Jettons, SPL, TRC-20, Stellar assets.</i>\n"
-        "<i>💡 TON & XLM memos shown automatically.</i>\n"
-        "<i>💡 Notifications use YOUR local timezone.</i>",
+        "<i>💡 Paste any address — bot auto-detects chain!</i>\n"
+        "<i>💡 Burn addresses blocked on all chains.</i>\n"
+        "<i>💡 Full IN+OUT detection on ALL chains.</i>\n"
+        "<i>💡 Notifications use YOUR timezone.</i>",
         parse_mode=ParseMode.HTML,
     )
 
+# ═══════════════════════════════════════════════════
+# ADMIN
+# ═══════════════════════════════════════════════════
 
-# ── Global error handler ────────────────────────────
-# Without this, any unhandled exception in a command or callback handler
-# (bad input we didn't anticipate, a transient Telegram API error, a
-# message that turned out too long, etc.) results in the user getting
-# absolutely no response and no indication anything went wrong.
-# `bot: Bot` is injected automatically by aiogram's dependency system,
-# the same way it is for ordinary message/callback handlers.
+@router.message(Command("admin"))
+async def cmd_admin(msg: types.Message):
+    cid = msg.chat.id
+    if not await is_admin(cid):
+        await reply_del(msg, "❌ Unauthorized.", parse_mode=ParseMode.HTML)
+        return
+    tu = await db.fetchone("SELECT COUNT(*) as c FROM users")
+    ta = await db.fetchone("SELECT COUNT(*) as c FROM addresses")
+    tn = await db.fetchone("SELECT COUNT(*) as c FROM notifications")
+    au = await db.fetchone("SELECT COUNT(DISTINCT chat_id) as c FROM addresses")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Stats", callback_data="a_stats"),
+         InlineKeyboardButton(text="📢 Broadcast", callback_data="a_bc")],
+        [InlineKeyboardButton(text="👥 Users", callback_data="a_users"),
+         InlineKeyboardButton(text="🔥 Burn List", callback_data="a_burn")],
+        [InlineKeyboardButton(text="🔄 Restart", callback_data="a_restart")],
+    ])
+    await msg.answer(
+        f"<b>🔐 Admin Panel</b>\n\n"
+        f"<b>👥 Users:</b> <code>{tu['c']}</code> (active: {au['c']})\n"
+        f"<b>📬 Addresses:</b> <code>{ta['c']}</code>\n"
+        f"<b>🔔 Notifications:</b> <code>{tn['c']}</code>\n\n"
+        f"<i>Select action:</i>",
+        parse_mode=ParseMode.HTML, reply_markup=kb,
+    )
+
+@router.callback_query(F.data == "a_stats")
+async def cb_astats(cb: types.CallbackQuery):
+    if not await is_admin(cb.message.chat.id):
+        await cb.answer("No", show_alert=True); return
+    tu = await db.fetchone("SELECT COUNT(*) as c FROM users")
+    ta = await db.fetchone("SELECT COUNT(*) as c FROM addresses")
+    tn = await db.fetchone("SELECT COUNT(*) as c FROM notifications")
+    n24 = await db.fetchone("SELECT COUNT(*) as c FROM notifications WHERE created_at > datetime('now', '-1 day')")
+    cbreak = await db.fetchall("SELECT chain, COUNT(*) as c FROM addresses GROUP BY chain ORDER BY c DESC")
+    ctext = "\n".join(f"  {CHAINS_BY_KEY.get(r['chain'], ChainCfg(r['chain'], r['chain'], '⬜', '', '', 0)).emoji} {CHAINS_BY_KEY.get(r['chain'], ChainCfg(r['chain'], r['chain'], '⬜', '', '', 0)).name}: <code>{r['c']}</code>" for r in cbreak)
+    await cb.message.edit_text(
+        f"<b>📊 Global Stats</b>\n\n"
+        f"<b>👥 Users:</b> <code>{tu['c']}</code>\n"
+        f"<b>📬 Addresses:</b> <code>{ta['c']}</code>\n"
+        f"<b>🔔 Total:</b> <code>{tn['c']}</code>\n"
+        f"<b>📈 24h:</b> <code>{n24['c']}</code>\n\n"
+        f"<b>By Chain:</b>\n{ctext}",
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+@router.callback_query(F.data == "a_bc")
+async def cb_abc(cb: types.CallbackQuery):
+    if not await is_admin(cb.message.chat.id):
+        await cb.answer("No", show_alert=True); return
+    await cb.message.edit_text(
+        "<b>📢 Broadcast</b>\n\nUse:\n<code>/broadcast Your message...</code>\nSends to ALL users.",
+        parse_mode=ParseMode.HTML,
+    )
+    await cb.answer()
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(msg: types.Message):
+    cid = msg.chat.id
+    if not await is_admin(cid):
+        await reply_del(msg, "❌ Unauthorized.", parse_mode=ParseMode.HTML); return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await reply_del(msg, "❌ <code>/broadcast message...</code>", parse_mode=ParseMode.HTML); return
+    text = parts[1]
+    users = await db.fetchall("SELECT chat_id FROM users")
+    sent = failed = 0
+    for u in users:
+        try:
+            await msg.bot.send_message(u["chat_id"], f"<b>📢 Announcement</b>\n\n{text}", parse_mode=ParseMode.HTML)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await reply_del(msg, f"✅ Broadcast: <code>{sent}</code> sent, <code>{failed}</code> failed.", parse_mode=ParseMode.HTML)
+
+@router.callback_query(F.data == "a_users")
+async def cb_ausers(cb: types.CallbackQuery):
+    if not await is_admin(cb.message.chat.id):
+        await cb.answer("No", show_alert=True); return
+    users = await db.fetchall(
+        "SELECT u.chat_id, u.username, u.first_name, u.timezone, u.notifications_enabled, u.is_admin, u.is_banned, u.created_at, "
+        "(SELECT COUNT(*) FROM addresses a WHERE a.chat_id=u.chat_id) AS wallet_count, "
+        "(SELECT COUNT(*) FROM notifications n WHERE n.chat_id=u.chat_id AND n.direction='incoming') AS in_count, "
+        "(SELECT COUNT(*) FROM notifications n WHERE n.chat_id=u.chat_id AND n.direction='outgoing') AS out_count, "
+        "(SELECT MAX(created_at) FROM notifications n WHERE n.chat_id=u.chat_id) AS last_alert "
+        "FROM users u ORDER BY u.created_at DESC LIMIT 10"
+    )
+    text = "<b>👥 Recent Users</b>\n\n"
+    for u in users:
+        username = f"@{html.escape(u['username'])}" if u["username"] else "not set"
+        full_name = html.escape(u["first_name"] or "not set")
+        role = "admin" if u["is_admin"] else "user"
+        ban_state = "BANNED" if u["is_banned"] else "active"
+        last_alert = u["last_alert"] or "no alerts"
+        text += f"ID: <code>{u['chat_id']}</code> | Name: <code>{full_name}</code> | Username: <code>{username}</code>\n"
+        text += f"Role: <code>{role}</code> | State: <code>{ban_state}</code> | Timezone: <code>{u['timezone']}</code> | Notifications: <code>{'ON' if u['notifications_enabled'] else 'PAUSED'}</code>\n"
+        text += f"Wallets: <code>{u['wallet_count']}</code> | IN: <code>{u['in_count']}</code> | OUT: <code>{u['out_count']}</code> | Last alert: <code>{last_alert}</code>\n"
+        name = u["first_name"] or u["username"] or "Unknown"
+        st = "🔔" if u["notifications_enabled"] else "🔕"
+        text += f"• <code>{u['chat_id']}</code> — <b>{name}</b> {st} {u['timezone']}\n"
+    await cb.message.edit_text(text, parse_mode=ParseMode.HTML)
+    await cb.answer()
+
+@router.message(Command("admin_user"))
+async def cmd_admin_user(msg: types.Message):
+    if not await is_admin(msg.chat.id):
+        await reply_del(msg, "Unauthorized.", parse_mode=ParseMode.HTML)
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        await reply_del(msg, "Usage: <code>/admin_user &lt;chat_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    target = int(parts[1].strip())
+    user = await db.fetchone(
+        "SELECT chat_id, username, first_name, timezone, notifications_enabled, is_admin, is_banned, created_at "
+        "FROM users WHERE chat_id=?", (target,)
+    )
+    if not user:
+        await reply_del(msg, "User not found.", parse_mode=ParseMode.HTML)
+        return
+    wallets = await db.fetchall(
+        "SELECT chain, address, label, created_at FROM addresses WHERE chat_id=? ORDER BY chain, created_at",
+        (target,)
+    )
+    counts = await db.fetchone(
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN direction='incoming' THEN 1 ELSE 0 END) AS incoming, "
+        "SUM(CASE WHEN direction='outgoing' THEN 1 ELSE 0 END) AS outgoing, "
+        "MAX(created_at) AS last_alert FROM notifications WHERE chat_id=?", (target,)
+    )
+    username = f"@{html.escape(user['username'])}" if user["username"] else "not set"
+    name = html.escape(user["first_name"] or "not set")
+    text = (
+        f"<b>Admin User Details</b>\n\n"
+        f"<b>Chat ID:</b> <code>{user['chat_id']}</code>\n"
+        f"<b>Name:</b> <code>{name}</code>\n"
+        f"<b>Username:</b> <code>{username}</code>\n"
+        f"<b>Role:</b> <code>{'admin' if user['is_admin'] else 'user'}</code>\n"
+        f"<b>State:</b> <code>{'BANNED' if user['is_banned'] else 'active'}</code>\n"
+        f"<b>Timezone:</b> <code>{user['timezone']}</code>\n"
+        f"<b>Notifications:</b> <code>{'ON' if user['notifications_enabled'] else 'PAUSED'}</code>\n"
+        f"<b>Registered:</b> <code>{user['created_at']}</code>\n"
+        f"<b>Alerts:</b> <code>{counts['total'] or 0}</code> total | "
+        f"<code>{counts['incoming'] or 0}</code> IN | <code>{counts['outgoing'] or 0}</code> OUT\n"
+        f"<b>Last alert:</b> <code>{counts['last_alert'] or 'none'}</code>\n\n"
+        f"<i>Wallet addresses are partially hidden for privacy.</i>\n"
+        f"<b>Wallets ({len(wallets)}):</b>\n"
+    )
+    if wallets:
+        for wallet in wallets:
+            wallet = dict(wallet)
+            wallet["address"] = mask_address(wallet["address"])
+            cfg = CHAINS_BY_KEY.get(wallet["chain"])
+            chain_name = cfg.name if cfg else wallet["chain"]
+            label = html.escape(wallet["label"] or "No label")
+            text += f"{chain_name}: <code>{wallet['address']}</code> — <i>{label}</i>\n"
+    else:
+        text += "None\n"
+    await send_long(msg, text, parse_mode=ParseMode.HTML)
+
+@router.callback_query(F.data == "a_burn")
+async def cb_aburn(cb: types.CallbackQuery):
+    if not await is_admin(cb.message.chat.id):
+        await cb.answer("No", show_alert=True); return
+    text = "<b>🔥 Burn Addresses</b>\n\n"
+    for chain, addrs in _BURN_MAP.items():
+        if addrs:
+            cfg = CHAINS_BY_KEY.get(chain)
+            name = cfg.name if cfg else chain.upper()
+            text += f"<b>{name}</b> ({len(addrs)})\n"
+            for a in list(addrs)[:5]:
+                text += f"  <code>{a}</code>\n"
+            if len(addrs) > 5:
+                text += f"  ... +{len(addrs) - 5} more\n"
+            text += "\n"
+    await cb.message.edit_text(text, parse_mode=ParseMode.HTML)
+    await cb.answer()
+
+@router.callback_query(F.data == "a_restart")
+async def cb_arestart(cb: types.CallbackQuery):
+    if not await is_admin(cb.message.chat.id):
+        await cb.answer("No", show_alert=True); return
+    for m in monitors.values():
+        m.running = False
+    await cb.message.edit_text("🔄 <b>Monitors stopped.</b> They'll auto-restart. Check /status.", parse_mode=ParseMode.HTML)
+    await cb.answer("Restarted")
+
+@router.message(Command("admin_promote"))
+async def cmd_promote(msg: types.Message):
+    if not await is_admin(msg.chat.id):
+        await reply_del(msg, "❌ Unauthorized.", parse_mode=ParseMode.HTML); return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await reply_del(msg, "❌ <code>/admin_promote &lt;chat_id&gt;</code>", parse_mode=ParseMode.HTML); return
+    try:
+        target = int(parts[1].strip())
+    except ValueError:
+        await reply_del(msg, "❌ Invalid chat_id.", parse_mode=ParseMode.HTML); return
+    await db.execute("UPDATE users SET is_admin=1 WHERE chat_id=?", (target,))
+    await reply_del(msg, f"✅ <code>{target}</code> promoted to admin.", parse_mode=ParseMode.HTML)
+
+# ── Error Handler ──────────────────────────────────
+
+@router.message(Command("ban"))
+async def cmd_ban(msg: types.Message):
+    if not await is_admin(msg.chat.id):
+        await reply_del(msg, "Unauthorized.", parse_mode=ParseMode.HTML)
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        await reply_del(msg, "Usage: <code>/ban &lt;chat_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    target = int(parts[1].strip())
+    if target == msg.chat.id or (Config.ADMIN_ID and target == Config.ADMIN_ID):
+        await reply_del(msg, "You cannot ban an administrator.", parse_mode=ParseMode.HTML)
+        return
+    cur = await db.execute("UPDATE users SET is_banned=1 WHERE chat_id=?", (target,))
+    result = "User banned." if cur.rowcount else "User not found."
+    await reply_del(msg, f"{result} <code>{target}</code>", parse_mode=ParseMode.HTML)
+
+@router.message(Command("unban"))
+async def cmd_unban(msg: types.Message):
+    if not await is_admin(msg.chat.id):
+        await reply_del(msg, "Unauthorized.", parse_mode=ParseMode.HTML)
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        await reply_del(msg, "Usage: <code>/unban &lt;chat_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    target = int(parts[1].strip())
+    cur = await db.execute("UPDATE users SET is_banned=0 WHERE chat_id=?", (target,))
+    result = "User unbanned." if cur.rowcount else "User not found."
+    await reply_del(msg, f"{result} <code>{target}</code>", parse_mode=ParseMode.HTML)
 
 @router.errors()
 async def on_error(event: types.ErrorEvent, bot: Bot):
@@ -1988,162 +2706,152 @@ async def on_error(event: types.ErrorEvent, bot: Bot):
         chat = update.message.chat
     elif update.callback_query and update.callback_query.message:
         chat = update.callback_query.message.chat
-
-    logger.error("Handler error on update %s: %s", update.update_id, event.exception, exc_info=event.exception)
-
-    if chat is not None:
+    logger.error("Error on update %s: %s", update.update_id, event.exception, exc_info=event.exception)
+    if chat:
         try:
-            await bot.send_message(
-                chat.id,
-                "⚠️ <b>Something went wrong processing that.</b>\n\n"
-                "It's been logged. Please try again, and if it keeps happening, "
-                "double-check your command with /help.",
-                parse_mode=ParseMode.HTML,
-            )
+            await bot.send_message(chat.id, "⚠️ <b>Something went wrong.</b>\n\nLogged. Try again or check /help.", parse_mode=ParseMode.HTML)
         except Exception:
-            pass  # Don't let a failure in the error handler itself raise.
+            pass
     return True
-
 
 # ═══════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════
 
-def build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Multi-Chain Telegram wallet monitor")
-    parser.add_argument("--list-chains", action="store_true", help="List configured networks and exit")
-    parser.add_argument("--check-rpcs", action="store_true", help="Test every configured RPC and exit")
-    return parser
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Multi-Chain Monitor")
+    p.add_argument("--list-chains", action="store_true", help="List networks and exit")
+    p.add_argument("--check-rpcs", action="store_true", help="Test RPCs and exit")
+    return p
 
+def cli_list():
+    for c in _CHAINS:
+        eps = [c.rpc, *c.rpc_fallbacks] if c.rpc else []
+        print(f"{c.key:<12} {c.name:<20} {c.type:<5} {len(eps)} endpoint(s)")
 
-def cli_list_chains():
-    for key, cfg in CHAINS.items():
-        endpoints = [cfg["rpc"], *cfg.get("rpc_fallbacks", [])] if cfg.get("rpc") else []
-        print(f"{key:<12} {cfg['name']:<20} {cfg['type']:<5} {len(endpoints)} RPC endpoint(s)")
-
-
-async def cli_check_rpcs():
+async def cli_check():
     async with httpx.AsyncClient(timeout=10) as client:
-        for key, cfg in CHAINS.items():
-            endpoints = [cfg["rpc"], *cfg.get("rpc_fallbacks", [])] if cfg.get("rpc") else []
-            if not endpoints:
-                print(f"{key:<12} SKIP (API monitor)")
+        for c in _CHAINS:
+            eps = [c.rpc, *c.rpc_fallbacks] if c.rpc else []
+            if not eps:
+                print(f"{c.key:<12} SKIP (API)")
                 continue
-            working = None
-            for endpoint in dict.fromkeys(endpoints):
+            ok = None
+            for ep in dict.fromkeys(eps):
+                if not ep:
+                    continue
                 try:
-                    method = "sui_getLatestCheckpointSequenceNumber" if cfg.get("type") == "sui" else "eth_chainId"
-                    response = await client.post(endpoint, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": []})
-                    response.raise_for_status()
-                    payload = response.json()
-                    if "result" in payload:
-                        working = endpoint
+                    method = "sui_getLatestCheckpointSequenceNumber" if c.type == "sui" else "eth_chainId"
+                    r = await client.post(ep, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": []})
+                    r.raise_for_status()
+                    if "result" in r.json():
+                        ok = ep
                         break
                 except Exception:
                     continue
-            if working:
-                print(f"{key:<12} OK   {working}")
-            else:
-                print(f"{key:<12} FAIL (all RPC endpoints unavailable)")
-
+            print(f"{c.key:<12} {'OK' if ok else 'FAIL':<5} {ok or '(all down)'}")
 
 async def main():
-    global db, evm_cache, spl_cache, active_monitors, app_started_at
-    app_started_at = datetime.now()
+    global db, tz_helper, notifier, evm_cache, spl_cache, monitors, app_start
+    app_start = datetime.now()
 
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("\n❌ Set TELEGRAM_BOT_TOKEN environment variable!\n")
+    if not Config.TOKEN or Config.TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("\n❌ Set TELEGRAM_BOT_TOKEN in .env\n")
         return
 
-    db = Database(DB_PATH)
-    evm_cache = EVMTokenCache()
-    spl_cache = SPLTokenCache()
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    db = DB(Config.DB_PATH)
+    tz_helper = TZHelper(db)
+    evm_cache = EVMCache()
+    spl_cache = SPLCache()
+    telegram_session = AiohttpSession(timeout=Config.TELEGRAM_TIMEOUT)
+    bot = Bot(token=Config.TOKEN, session=telegram_session)
+    notifier = Notifier(db, tz_helper, bot)
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Register the Telegram command menu before contacting any blockchain RPC.
-    # A slow or unavailable RPC must never delay the bot's command interface.
-    monitors = []
-    active_monitors = {}
-    for k, c in CHAINS.items():
-        if c.get("type") == "evm":
-            monitor = EVMMonitor(k, c, db, bot, evm_cache)
-            active_monitors[k] = monitor
-            monitors.append(monitor.start())
-        elif k == "ton":
-            monitor = TONMonitor(k, c, db, bot)
-            active_monitors[k] = monitor
-            monitors.append(monitor.start())
-        elif k == "xlm":
-            monitor = XLMMonitor(k, c, db, bot)
-            active_monitors[k] = monitor
-            monitors.append(monitor.start())
-        elif k == "sol":
-            monitor = SOLMonitor(k, c, db, bot, spl_cache)
-            active_monitors[k] = monitor
-            monitors.append(monitor.start())
-        elif k == "tron":
-            monitor = TRONMonitor(k, c, db, bot)
-            active_monitors[k] = monitor
-            monitors.append(monitor.start())
-        elif k == "btc":
-            monitor = BTCMonitor(k, c, db, bot)
-            active_monitors[k] = monitor
-            monitors.append(monitor.start())
-        elif k == "sui":
-            monitor = SUIMonitor(k, c, db, bot)
-            active_monitors[k] = monitor
-            monitors.append(monitor.start())
+    monitors = {}
+    tasks = []
+    for c in _CHAINS:
+        if c.type == "evm":
+            m = EVMMonitor(c.key, c, db, notifier, evm_cache)
+        elif c.key == "ton":
+            m = TONMonitor(c.key, c, db, notifier)
+        elif c.key == "xlm":
+            m = XLMMonitor(c.key, c, db, notifier)
+        elif c.key == "sol":
+            m = SOLMonitor(c.key, c, db, notifier, spl_cache)
+        elif c.key == "tron":
+            m = TRONMonitor(c.key, c, db, notifier)
+        elif c.key == "btc":
+            m = BTCMonitor(c.key, c, db, notifier)
+        elif c.key == "sui":
+            m = SUIMonitor(c.key, c, db, notifier)
+        else:
+            continue
+        monitors[c.key] = m
+        tasks.append(asyncio.create_task(m.run(), name=f"monitor:{c.key}"))
 
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Open the main menu"),
-        BotCommand(command="status", description="Show monitor and network health"),
-        BotCommand(command="add", description="Add a wallet address"),
-        BotCommand(command="rename", description="Rename a wallet label"),
-        BotCommand(command="remove", description="Remove a wallet address"),
-        BotCommand(command="list", description="List monitored addresses"),
-        BotCommand(command="report", description="Show detailed wallet report"),
-        BotCommand(command="history", description="Show recent alerts"),
-        BotCommand(command="clearhistory", description="Clear your alert history"),
-        BotCommand(command="pause", description="Pause notifications"),
-        BotCommand(command="resume", description="Resume notifications"),
-        BotCommand(command="stats", description="Show monitoring statistics"),
-        BotCommand(command="chains", description="List supported networks"),
-        BotCommand(command="timezone", description="Set notification timezone"),
-        BotCommand(command="export", description="Export monitored addresses"),
-        BotCommand(command="help", description="Show command help"),
-        BotCommand(command="test", description="Test Telegram notifications"),
-    ])
+    cmds = [
+        BotCommand(command="start", description="Main menu"),
+        BotCommand(command="ask", description="Ask about the project locally"),
+        BotCommand(command="status", description="Monitor health"),
+        BotCommand(command="add", description="Add wallet (auto-detects chain)"),
+        BotCommand(command="rename", description="Rename wallet label"),
+        BotCommand(command="label", description="Set custom wallet label"),
+        BotCommand(command="admin_user", description="Admin: view full user details"),
+        BotCommand(command="ban", description="Admin: ban a user"),
+        BotCommand(command="unban", description="Admin: unban a user"),
+        BotCommand(command="remove", description="Remove wallet"),
+        BotCommand(command="list", description="List wallets"),
+        BotCommand(command="report", description="Wallet report with counts"),
+        BotCommand(command="history", description="Alert history"),
+        BotCommand(command="clearhistory", description="Clear history"),
+        BotCommand(command="pause", description="Pause alerts"),
+        BotCommand(command="resume", description="Resume alerts"),
+        BotCommand(command="stats", description="Your statistics"),
+        BotCommand(command="chains", description="Supported networks"),
+        BotCommand(command="timezone", description="Set timezone"),
+        BotCommand(command="export", description="Export addresses"),
+        BotCommand(command="help", description="Command help"),
+        BotCommand(command="test", description="Test alert"),
+    ]
+    await bot.set_my_commands(cmds)
 
-    logger.info("🤖 Bot starting... %d chains | ALL tokens | History | Timezone", len(CHAINS))
-
-    if ADMIN_CHAT_ID:
+    if Config.ADMIN_ID:
         try:
             await bot.send_message(
-                ADMIN_CHAT_ID,
-                f"🤖 <b>telegram-multichain-monitor is Online</b>\n\n"
-                f"✅ <b>Networks:</b> {len(CHAINS)} configured\n"
-                f"✅ <b>Monitoring:</b> native coins, ERC-20s, and supported chain tokens\n"
-                f"✅ <b>Reliability:</b> RPC failover and automatic reconnection\n"
-                f"✅ <b>Alerts:</b> incoming and outgoing EVM transfers\n\n"
-                f"Use <code>/status</code> for live health or <code>/help</code> for commands.",
+                Config.ADMIN_ID,
+                f"🤖 <b>Multi-Chain Monitor Online</b>\n\n"
+                f"✅ <b>Networks:</b> {len(_CHAINS)}\n"
+                f"✅ <b>Monitoring:</b> native + all tokens\n"
+                f"✅ <b>Directions:</b> FULL IN+OUT on ALL chains\n"
+                f"✅ <b>Reliability:</b> RPC failover + reconnect\n"
+                f"✅ <b>Features:</b> Burn detect, auto chain, auto-delete, admin\n\n"
+                f"<code>/admin</code> for panel | <code>/help</code> for commands",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
 
+    polling_task = asyncio.create_task(dp.start_polling(bot), name="telegram-polling")
     try:
-        await asyncio.gather(dp.start_polling(bot), *monitors)
+        await asyncio.gather(polling_task, *tasks)
     finally:
+        polling_task.cancel()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(polling_task, *tasks, return_exceptions=True)
+        await asyncio.gather(*(m.stop() for m in monitors.values()), return_exceptions=True)
+        await spl_cache.close()
         await bot.session.close()
-
+        # Give aiohttp time to finish closing SSL transports before the loop exits.
+        await asyncio.sleep(0.25)
 
 if __name__ == "__main__":
-    args = build_cli_parser().parse_args()
+    args = build_parser().parse_args()
     if args.list_chains:
-        cli_list_chains()
+        cli_list()
     elif args.check_rpcs:
-        asyncio.run(cli_check_rpcs())
+        asyncio.run(cli_check())
     else:
         asyncio.run(main())
