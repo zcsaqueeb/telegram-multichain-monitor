@@ -1,178 +1,147 @@
-# telegram-multichain-monitor
+# Telegram Multichain Monitor
 
-## Multi-Chain Telegram Wallet Monitor
+> Real-time Telegram alerts for wallet activity across 25 blockchain networks.
 
-A resilient Telegram bot that watches wallet addresses and sends incoming-transfer alerts across EVM and non-EVM networks.
+Monitor native assets and tokens, track incoming and outgoing transfers, and manage everything from Telegram. Wallets are detected automatically from their address format, or you can specify a chain explicitly.
 
-## Features
+## Highlights
 
-- Native-coin and token alerts across 19 EVM networks
-- Incoming and outgoing EVM transfer tracking for native coins and ERC-20 tokens
-- TON Jettons, Stellar assets, Solana SPL, TRON TRC-20, and Sui fungible Move coins
-- Bitcoin native-transfer monitoring
-- Automatic RPC failover, log-range splitting, and reconnection
-- Per-user timezones, history, labels, export, statistics, and health status
-- Pause/resume notifications without removing wallets
-- Automatic Telegram command menu registration
-- CLI tools for chain listing and RPC checks
+- **25 supported networks** with EVM and non-EVM monitoring
+- **Incoming and outgoing transfer alerts**
+- **Automatic chain detection** when adding wallets
+- **Native asset and token monitoring** with token metadata lookup
+- **Burn/dead-address protection** to prevent monitoring unrecoverable addresses
+- **Fast asynchronous polling** with concurrent EVM scans
+- **SQLite persistence** with WAL mode, batching, and optimized caching
+- **Duplicate-alert prevention** and rate limiting
+- **Per-user timezone and notification controls**
+- **Configurable automatic message deletion**
+- **Admin panel** with broadcast and monitor controls
+- **Custom EVM chain support** through environment configuration
+
+## Supported networks
+
+### EVM networks
+
+Ethereum, BNB Smart Chain, Polygon, Arbitrum, Optimism, Base, Avalanche, Fantom, zkSync, Linea, Scroll, Mantle, Gnosis, Celo, Cronos, Moonbeam, Robinhood Chain, Merlin Chain, and HyperEVM.
+
+### Other networks
+
+TON, Stellar, Solana, TRON, Bitcoin, and Sui.
 
 ## Requirements
 
-- Python 3.10+
-- Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Network access to Telegram and blockchain RPC/API endpoints
+- Python 3.10 or newer
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Network access to the configured public RPC and API endpoints
 
 ## Installation
 
 ```bash
-git clone <your-repository-url>
-cd multichain-monitor
+git clone https://github.com/zcsaqueeb/telegram-multichain-monitor.git
+cd telegram-multichain-monitor
 python -m venv .venv
 
 # Linux/macOS
 source .venv/bin/activate
 
 # Windows PowerShell
-.venv\Scripts\Activate.ps1
+# .venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-## Configuration
-
-Create `.env` beside `bot.py`:
+Create a `.env` file beside `bot.py`:
 
 ```env
-TELEGRAM_BOT_TOKEN=123456:replace_with_your_token
-ADMIN_CHAT_ID=
-TON_API_KEY=
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+
+# Optional settings
+ADMIN_CHAT_ID=123456789
 DB_PATH=data/monitor.db
-EXTRA_EVM_CHAINS=
+TON_API_KEY=your_tonapi_key
+AUTO_DELETE_DELAY=30
 ```
 
-The bot loads `.env` automatically. Operating-system environment variables take precedence. Never commit or share `.env`.
-
-## Run
+Start the monitor:
 
 ```bash
 python bot.py
 ```
 
-Windows example:
-
-```bat
-C:\Python314\python.exe C:\Users\saque\Desktop\multichain-monitor\bot.py
-```
+The database is created automatically at `data/monitor.db` unless `DB_PATH` is changed.
 
 ## Telegram commands
 
 | Command | Description |
-|---|---|
+| --- | --- |
 | `/start` | Open the main menu |
-| `/status` | Health, uptime, notification state, and latest alert |
-| `/add <chain> <address> [label]` | Start monitoring an address |
-| `/rename <chain> <address> <label>` | Change an address label |
-| `/remove <chain> <address>` | Stop monitoring an address |
-| `/list [chain]` | List all addresses or filter by chain |
-| `/report` or `/wallets` | Detailed wallet and alert report |
-| `/history [limit]` | Show up to 50 recent alerts |
-| `/clearhistory` | Delete your notification history |
-| `/pause` | Pause your notifications |
-| `/resume` | Resume your notifications |
-| `/stats` | Show address and alert statistics |
-| `/chains` | List supported networks |
-| `/timezone [IANA zone]` | Set notification timezone |
+| `/add <address> [label]` | Add a wallet with automatic chain detection |
+| `/add <chain> <address> [label]` | Add a wallet with an explicit chain |
+| `/remove <chain> <address>` | Remove a wallet |
+| `/rename <chain> <address> <label>` | Rename a wallet |
+| `/list [chain]` | List monitored wallets |
+| `/report` | Show alert counts by wallet |
+| `/history [limit]` | View alert history, up to 50 records |
+| `/clearhistory` | Clear alert history |
+| `/pause` / `/resume` | Pause or resume notifications |
+| `/timezone [zone]` | Set the display timezone |
+| `/stats` | Show your usage statistics |
+| `/status` | Check monitor health |
+| `/test` | Send a sample alert |
 | `/export` | Export monitored addresses |
-| `/test` | Test Telegram delivery |
+| `/chains` | List supported networks |
 | `/help` | Show command help |
 
-Examples:
+Administrators can also use `/admin` and `/broadcast <message>` when `ADMIN_CHAT_ID` is configured.
+
+## Adding wallets
+
+Automatic detection examples:
 
 ```text
-/add robinhood 0x1234... Trading Wallet
-/add sui 0x1234... Sui Wallet
-/list sui
-/history 20
-/pause
-/resume
+/add 0xYourEvmAddress Main wallet
+/add EQYourTonAddress TON wallet
+/add GYourStellarAddress Stellar wallet
+/add YourSolanaAddress Solana wallet
+/add TYourTronAddress TRON wallet
+/add bc1qYourBitcoinAddress Bitcoin wallet
 ```
 
-An EVM address monitors that wallet across all configured EVM chains. Use `/chains` for exact names.
+For ambiguous or custom EVM addresses, use the explicit form:
 
-## Supported networks
-
-### EVM
-
-Ethereum, BSC, Polygon, Arbitrum, Optimism, Base, Avalanche, Fantom, zkSync, Linea, Scroll, Mantle, Gnosis, Celo, Cronos, Moonbeam, Robinhood Chain, Merlin Chain, and HyperEVM.
-
-### Other networks
-
-TON, Stellar, Solana, TRON, Bitcoin, and Sui. Sui currently monitors SUI and fungible Move coins; NFT/object transfers are not included.
-
-## RPC resilience
-
-EVM networks use primary and fallback RPC endpoints. Timeout, 4xx/5xx, provider, and log-limit failures trigger retries, smaller log ranges, or endpoint rotation. A failed network does not stop the bot or other monitors.
-
-Check connectivity without starting Telegram polling:
-
-```bash
-python bot.py --list-chains
-python bot.py --check-rpcs
+```text
+/add ethereum 0xYourEvmAddress Main wallet
 ```
 
-Additional EVM networks can be configured with `EXTRA_EVM_CHAINS`:
+## Custom EVM chains
+
+Additional EVM chains can be supplied as JSON in `EXTRA_EVM_CHAINS`:
 
 ```env
-EXTRA_EVM_CHAINS={"zora":{"name":"Zora","rpc":"https://rpc.zora.energy","explorer":"https://explorer.zora.energy/tx/","native":"ETH"}}
+EXTRA_EVM_CHAINS={"mychain":{"name":"My Chain","native":"MYC","rpc":"https://rpc.example.com","explorer":"https://explorer.example.com/tx/","chain_id":12345,"poll":5}}
 ```
 
-Public RPCs may be rate-limited. Use provider-backed endpoints for high-volume production deployments.
+Each custom chain requires `name`, `native`, `rpc`, and `explorer`. `chain_id`, `poll`, `emoji`, and `rpc_fallbacks` are optional.
 
-## Database and backups
+## Performance design
 
-SQLite is stored at `DB_PATH`, defaulting to `data/monitor.db`. It contains addresses, labels, settings, and notification history. Back up the database regularly, preferably while the bot is stopped.
+- Async HTTP and blockchain requests
+- Concurrent token metadata and EVM transfer checks
+- Batched database writes and deduplication
+- SQLite WAL mode with a 64 MB cache
+- TTL caches for user preferences, timezones, and token metadata
+- Compiled address patterns and constant-time burn-address lookups
+- Structured configuration and alert objects using dataclasses and type hints
 
-## Production deployment
+## Security notes
 
-Use systemd, Docker, PM2, or Windows Task Scheduler with automatic restart, persistent database storage, and log rotation.
+- Keep `.env` private and never commit bot tokens or API keys.
+- Use a restricted Telegram admin chat ID and verify it before enabling admin features.
+- Public RPC and API endpoints may have rate limits; replace them with private endpoints if needed.
+- A monitored wallet is read-only. This bot does not request private keys or sign transactions.
 
-Example systemd service:
+## License
 
-```ini
-[Unit]
-Description=Multi-Chain Telegram Wallet Monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/multichain-monitor
-ExecStart=/opt/multichain-monitor/.venv/bin/python bot.py
-Restart=always
-RestartSec=10
-EnvironmentFile=/opt/multichain-monitor/.env
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now multichain-monitor
-sudo journalctl -u multichain-monitor -f
-```
-
-## Troubleshooting
-
-**Token missing:** confirm the file is named `.env`, is beside `bot.py`, and contains exactly `TELEGRAM_BOT_TOKEN=...`.
-
-**Network reconnecting:** run `python bot.py --check-rpcs`. Public providers may be temporarily unavailable; automatic retry will continue.
-
-**No alerts:** run `/status`, check notifications are `ON`, verify `/list`, and run `/test`.
-
-## Security
-
-The bot only needs read access to blockchain APIs and never needs private keys. Do not store private keys in `.env`, source files, or the database.
-
-MIT License.
+Add the license that matches how you want to distribute this project.
