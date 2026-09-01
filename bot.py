@@ -1539,6 +1539,7 @@ spl_cache: SPLCache
 monitors: Dict[str, Monitor] = {}
 app_start: Optional[datetime] = None
 ask_sessions: Dict[int, float] = {}
+ask_topics: Dict[int, str] = {}
 
 # ── Helpers ────────────────────────────────────────
 
@@ -1613,7 +1614,26 @@ async def is_admin(cid: int) -> bool:
     pref = await db.get_user_prefs(cid)
     return bool(pref.get("admin", 0))
 
-def local_project_answer(question: str) -> str:
+def assistant_topic(question: str) -> str:
+    """Classify a question using local weighted keywords for follow-up context."""
+    q = question.lower()
+    topics = {
+        "wallet": ("wallet", "address", "add", "monitor", "watch", "remove", "delete"),
+        "transfer": ("transfer", "incoming", "outgoing", "inbound", "outbound", "transaction"),
+        "token": ("token", "erc20", "erc-20", "trc20", "trc-20", "jetton", "spl", "contract", "mint"),
+        "network": ("chain", "network", "ethereum", "bitcoin", "solana", "tron", "ton", "stellar"),
+        "alert": ("alert", "notification", "receive", "not working", "test", "pause", "resume"),
+        "admin": ("admin", "ban", "unban", "spam", "broadcast"),
+        "history": ("history", "previous", "past", "report", "stats", "statistics"),
+        "configuration": ("env", "config", "database", "sqlite", "timezone", "auto-delete"),
+        "reliability": ("rpc", "backup", "offline", "reconnect", "connection", "error"),
+        "security": ("private key", "security", "safe", "privacy", "read-only"),
+    }
+    scores = {topic: sum(1 for word in words if word in q) for topic, words in topics.items()}
+    return max(scores, key=scores.get) if max(scores.values(), default=0) else "general"
+
+
+def local_project_answer(question: str, context: str = "") -> str:
     """Answer project questions locally from the bot's configured features."""
     q = re.sub(r"[^a-z0-9?\s-]+", " ", question.lower()).strip()
     # Normalize a few common user typos so the offline assistant remains forgiving.
@@ -1623,6 +1643,8 @@ def local_project_answer(question: str) -> str:
         "recieve": "receive", "recieving": "receiving", "recieveing": "receiving", "suppoted": "supported",
     }.items():
         q = re.sub(rf"\b{wrong}\b", right, q)
+    if context and (len(q.split()) <= 5 or any(word in q.split() for word in ("it", "that", "this", "those", "more"))):
+        q = f"{context} {q}"
     chain_count = len(_CHAINS)
     evm_count = len(EVM_KEYS)
     other_names = ", ".join(c.name for c in _CHAINS if c.type != "evm")
@@ -1747,6 +1769,7 @@ async def cmd_ask(msg: types.Message):
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         ask_sessions[msg.chat.id] = time.monotonic()
+        ask_topics.pop(msg.chat.id, None)
         await reply_del(
             msg,
             "<b>💬 Project Assistant</b>\n\n"
@@ -1759,19 +1782,21 @@ async def cmd_ask(msg: types.Message):
     question = parts[1].strip()
     if question.casefold() in {"cancel", "stop", "exit"}:
         ask_sessions.pop(msg.chat.id, None)
+        ask_topics.pop(msg.chat.id, None)
         await reply_del(msg, "<b>Project Assistant closed.</b>", parse_mode=ParseMode.HTML)
         return
     ask_sessions[msg.chat.id] = time.monotonic()
-    await reply_del(msg, format_project_answers(question), parse_mode=ParseMode.HTML)
+    await reply_del(msg, format_project_answers(question, ask_topics.get(msg.chat.id, "")), parse_mode=ParseMode.HTML)
+    ask_topics[msg.chat.id] = assistant_topic(question)
 
 
-def format_project_answers(question: str) -> str:
+def format_project_answers(question: str, context: str = "") -> str:
     """Format one or several local FAQ answers for a conversational reply."""
     parts = [p.strip() for p in re.split(r"(?:\?\s+|[\r\n]+|;\s+)", question) if p.strip()]
     parts = parts[:4]
     answers = []
     for index, part in enumerate(parts, 1):
-        answer = local_project_answer(part)
+        answer = local_project_answer(part, context)
         if len(parts) > 1:
             answers.append(f"<b>{index}. {html.escape(part[:240])}</b>\n\n{answer}")
         else:
@@ -1790,6 +1815,7 @@ def _is_pending_ask(msg: types.Message) -> bool:
         return False
     if time.monotonic() - started > 300:
         ask_sessions.pop(msg.chat.id, None)
+        ask_topics.pop(msg.chat.id, None)
         return False
     return bool(msg.text and not msg.text.lstrip().startswith("/"))
 
@@ -1801,9 +1827,11 @@ async def cmd_ask_question(msg: types.Message):
     question = (msg.text or "").strip()
     if question.casefold() in {"cancel", "stop", "exit"}:
         ask_sessions.pop(msg.chat.id, None)
+        ask_topics.pop(msg.chat.id, None)
         await reply_del(msg, "<b>Project Assistant closed.</b>", parse_mode=ParseMode.HTML)
         return
-    answer = local_project_answer(question)
+    answer = local_project_answer(question, ask_topics.get(msg.chat.id, ""))
+    ask_topics[msg.chat.id] = assistant_topic(question)
     await reply_del(
         msg,
         f"<b>💬 Project Assistant</b>\n\n"
