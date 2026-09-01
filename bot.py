@@ -106,6 +106,15 @@ for h in logging.getLogger().handlers:
     h.addFilter(_RedactFilter())
 logger = logging.getLogger("tmm")
 
+
+def _asyncio_exception_handler(loop, context):
+    """Ignore expected Windows socket resets during remote disconnects."""
+    exc = context.get("exception")
+    winerror = getattr(exc, "winerror", None)
+    if isinstance(exc, OSError) and winerror in {10053, 10054, 995}:
+        return
+    loop.default_exception_handler(context)
+
 # ═══════════════════════════════════════════════════
 # CHAIN REGISTRY
 # ═══════════════════════════════════════════════════
@@ -1606,18 +1615,36 @@ async def is_admin(cid: int) -> bool:
 
 def local_project_answer(question: str) -> str:
     """Answer project questions locally from the bot's configured features."""
-    q = question.lower().strip()
+    q = re.sub(r"[^a-z0-9?\s-]+", " ", question.lower()).strip()
+    # Normalize a few common user typos so the offline assistant remains forgiving.
+    for wrong, right in {
+        "quesiton": "question", "qusetion": "question", "walet": "wallet",
+        "transection": "transaction", "notifcation": "notification",
+        "recieve": "receive", "recieving": "receiving", "recieveing": "receiving", "suppoted": "supported",
+    }.items():
+        q = re.sub(rf"\b{wrong}\b", right, q)
     chain_count = len(_CHAINS)
     evm_count = len(EVM_KEYS)
     other_names = ", ".join(c.name for c in _CHAINS if c.type != "evm")
 
-    if any(word in q for word in ("supported", "support", "chain", "network")):
+    if q in {"hi", "hello", "hey", "good morning", "good evening"}:
+        return "<b>Project Assistant</b>\n\nHello! Ask me about wallets, chains, transfers, alerts, commands, or troubleshooting."
+    if any(word in q for word in ("what is this", "what does this", "how does this", "about this bot", "about the bot")):
+        return (
+            "<b>About this monitor</b>\n\n"
+            "This Telegram bot watches public wallet addresses across multiple blockchains and sends alerts for "
+            "incoming and outgoing native-coin and token transfers. It is read-only and does not need private keys.\n\n"
+            "Start with <code>/add &lt;address&gt; [label]</code>, then check <code>/status</code>."
+        )
+    if (any(word in q for word in ("supported", "support", "chain", "network"))
+            and not any(word in q for word in ("token", "asset", "coin", "jetton", "spl", "erc20", "erc-20", "trc20", "trc-20"))):
         return (
             f"<b>Supported networks</b>\n\n"
             f"The monitor supports <b>{chain_count} networks</b>: {evm_count} EVM networks plus {other_names}.\n\n"
             "EVM wallets are added once and monitored across every configured EVM network."
         )
-    if any(word in q for word in ("add wallet", "add address", "monitor wallet", "watch wallet")):
+    if (re.search(r"\b(add|monitor|watch)\b", q)
+            and ("wallet" in q or "address" in q)):
         return (
             "<b>Add a wallet</b>\n\n"
             "Use automatic detection:\n"
@@ -1640,7 +1667,14 @@ def local_project_answer(question: str) -> str:
             "The bot detects incoming and outgoing native-asset and token transfers. "
             "Alerts include the amount, sender, receiver, transaction link, block, time, and token contract when available."
         )
-    if any(word in q for word in ("contract", "token address", "ca")):
+    if (any(word in q for word in ("native", "coin", "erc-20", "erc20", "trc-20", "trc20", "jetton", "spl", "move coin", "token"))
+            and "contract" not in q and "address" not in q):
+        return (
+            "<b>Assets monitored</b>\n\n"
+            "The bot monitors native coins and supported token standards, including ERC-20, TRC-20, TON Jettons, "
+            "Stellar assets, Solana SPL tokens, and Sui Move coins. Token alerts show the asset name and contract or mint when available."
+        )
+    if "contract" in q or "token address" in q or " ca " in f" {q} ":
         return (
             "<b>Token contract addresses</b>\n\n"
             "Token alerts include the contract or token identifier. Native coins do not show a contract because they are network assets."
@@ -1661,6 +1695,20 @@ def local_project_answer(question: str) -> str:
         )
     if any(word in q for word in ("history", "past alert", "previous alert")):
         return "<b>Alert history</b>\n\nUse <code>/history [limit]</code> to view up to 50 saved alerts, or <code>/clearhistory</code> to remove them."
+    if any(word in q for word in ("list wallet", "show wallet", "my wallet", "my address")):
+        return "<b>View wallets</b>\n\nUse <code>/list</code> to view your monitored wallets, or <code>/list ethereum</code> for one chain."
+    if any(word in q for word in ("remove wallet", "delete wallet", "stop monitor", "unmonitor")):
+        return "<b>Remove a wallet</b>\n\nUse <code>/remove &lt;chain&gt; &lt;address&gt;</code> to stop monitoring a wallet."
+    if any(word in q for word in ("pause", "resume", "stop alert", "start alert")):
+        return "<b>Notification controls</b>\n\nUse <code>/pause</code> to pause alerts and <code>/resume</code> to enable them again."
+    if any(word in q for word in ("report", "statistics", "stats", "count", "how many alert")):
+        return "<b>Statistics</b>\n\nUse <code>/stats</code> for your totals and <code>/report</code> for alert counts by wallet."
+    if any(word in q for word in ("export", "download address")):
+        return "<b>Export</b>\n\nUse <code>/export</code> to export your monitored addresses and labels."
+    if any(word in q for word in ("test alert", "testing", "test notification")):
+        return "<b>Test notifications</b>\n\nUse <code>/test</code> to send a sample alert and verify Telegram delivery."
+    if any(word in q for word in ("not receive", "not receiving", "no alert", "alerts not", "not working", "bug", "error")):
+        return "<b>Troubleshooting</b>\n\nCheck <code>/status</code>, confirm the wallet is listed with <code>/list</code>, and send <code>/test</code>. RPC backups retry automatically."
     if any(word in q for word in ("rpc", "backup", "connection", "offline", "reconnect")):
         return (
             "<b>RPC reliability</b>\n\n"
@@ -1674,6 +1722,18 @@ def local_project_answer(question: str) -> str:
             "The monitor is read-only. It does not request, store, or use private keys and never signs transactions. "
             "Keep your <code>.env</code> file private."
         )
+    if any(word in q for word in ("status", "health", "running", "online", "connected")):
+        return "<b>Monitor status</b>\n\nUse <code>/status</code> to see whether each chain is polling, reconnecting, or unavailable."
+    if any(word in q for word in ("auto delete", "autodelete", "delete message", "message deleted")):
+        return "<b>Auto-delete</b>\n\nBot replies can be automatically deleted after <code>AUTO_DELETE_DELAY</code> seconds. Configure that value in <code>.env</code>."
+    if any(word in q for word in ("env", "environment", "bot token", "api key", "configuration", "configure")):
+        return "<b>Configuration</b>\n\nSet <code>TELEGRAM_BOT_TOKEN</code> and optional values such as <code>ADMIN_CHAT_ID</code>, <code>DB_PATH</code>, <code>TON_API_KEY</code>, and <code>AUTO_DELETE_DELAY</code> in <code>.env</code>."
+    if any(word in q for word in ("database", "sqlite", "store data", "save data")):
+        return "<b>Database</b>\n\nThe bot stores users, monitored addresses, chain cursors, preferences, and alert history in SQLite. The default path is <code>data/monitor.db</code>."
+    if any(word in q for word in ("burn", "blacklist", "dead address")):
+        return "<b>Burn-address protection</b>\n\nKnown burn addresses are filtered so burn transfers do not create normal wallet alerts."
+    if any(word in q for word in ("api", "artificial intelligence", "ai", "chatbot")):
+        return "<b>Offline assistant</b>\n\nThis assistant uses local project rules and runtime configuration only. It does not call an AI API or send your question outside the bot."
     if any(word in q for word in ("command", "help", "what can", "how use")):
         return "<b>Available commands</b>\n\nUse <code>/help</code> for the full command list. Start with <code>/add &lt;address&gt; [label]</code>, then use <code>/status</code> and <code>/history</code>."
     return (
@@ -1696,7 +1756,31 @@ async def cmd_ask(msg: types.Message):
             parse_mode=ParseMode.HTML,
         )
         return
-    await reply_del(msg, local_project_answer(parts[1]), parse_mode=ParseMode.HTML)
+    question = parts[1].strip()
+    if question.casefold() in {"cancel", "stop", "exit"}:
+        ask_sessions.pop(msg.chat.id, None)
+        await reply_del(msg, "<b>Project Assistant closed.</b>", parse_mode=ParseMode.HTML)
+        return
+    ask_sessions[msg.chat.id] = time.monotonic()
+    await reply_del(msg, format_project_answers(question), parse_mode=ParseMode.HTML)
+
+
+def format_project_answers(question: str) -> str:
+    """Format one or several local FAQ answers for a conversational reply."""
+    parts = [p.strip() for p in re.split(r"(?:\?\s+|[\r\n]+|;\s+)", question) if p.strip()]
+    parts = parts[:4]
+    answers = []
+    for index, part in enumerate(parts, 1):
+        answer = local_project_answer(part)
+        if len(parts) > 1:
+            answers.append(f"<b>{index}. {html.escape(part[:240])}</b>\n\n{answer}")
+        else:
+            answers.append(answer)
+    return (
+        "<b>💬 Project Assistant</b>\n\n"
+        + "\n\n".join(answers)
+        + "\n\n<i>Ask another project question, or send /ask cancel to close.</i>"
+    )
 
 
 def _is_pending_ask(msg: types.Message) -> bool:
@@ -1712,15 +1796,20 @@ def _is_pending_ask(msg: types.Message) -> bool:
 
 @router.message(_is_pending_ask)
 async def cmd_ask_question(msg: types.Message):
-    ask_sessions.pop(msg.chat.id, None)
+    # Keep the session alive so users can ask follow-up questions without /ask.
+    ask_sessions[msg.chat.id] = time.monotonic()
     question = (msg.text or "").strip()
+    if question.casefold() in {"cancel", "stop", "exit"}:
+        ask_sessions.pop(msg.chat.id, None)
+        await reply_del(msg, "<b>Project Assistant closed.</b>", parse_mode=ParseMode.HTML)
+        return
     answer = local_project_answer(question)
     await reply_del(
         msg,
         f"<b>💬 Project Assistant</b>\n\n"
         f"<b>Your question:</b> <i>{html.escape(question[:300])}</i>\n\n"
         f"{answer}\n\n"
-        "<i>Ask another question anytime with /ask.</i>",
+        "<i>Ask another question directly, or send /ask cancel to close.</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -2754,6 +2843,7 @@ async def cli_check():
 async def main():
     global db, tz_helper, notifier, evm_cache, spl_cache, monitors, app_start
     app_start = datetime.now()
+    asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
 
     if not Config.TOKEN or Config.TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("\n❌ Set TELEGRAM_BOT_TOKEN in .env\n")
