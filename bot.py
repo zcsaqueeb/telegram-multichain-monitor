@@ -10,6 +10,7 @@ Author: Assistant | License: MIT
 import asyncio
 import argparse
 import base64
+import html as html_lib
 from collections import defaultdict, deque
 import logging
 import os
@@ -355,7 +356,7 @@ class BaseMonitor(ABC):
                       asset: str, from_addr: str, to_addr: str, tx_hash: str,
                       memo: Optional[str] = None, extra: Optional[str] = None,
                       asset_raw: Optional[str] = None, amount_raw: Optional[str] = None,
-                      wallet_address: Optional[str] = None):
+                      wallet_address: Optional[str] = None, block: Optional[int] = None):
         preference = await self.db.fetchone(
             "SELECT notifications_enabled FROM users WHERE chat_id=?", (chat_id,)
         )
@@ -385,6 +386,8 @@ class BaseMonitor(ABC):
             text += f"<b>📝 Memo:</b> <code>{memo}</code>\n"
         if extra:
             text += f"{extra}\n"
+        if block is not None:
+            text += f"<b>📦 Block:</b> <code>{block}</code>\n"
         text += (
             f"<b>🔗 Tx:</b> <a href='{self.cfg['explorer']}{tx_hash}'>{tx_short}</a>\n"
             f"<b>⏰ Time:</b> <code>{time_str}</code>"
@@ -521,20 +524,25 @@ class EVMMonitor(BaseMonitor):
             users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='evm' AND LOWER(address)=?", (watched_addr.lower(),))
             for u in users:
                 cid = u["chat_id"]
-                if await self._dedup(cid, tx_hash, li):
-                    continue
-                info = await self.cache.get_info(self.w3, token_addr)
-                amt = Decimal(amount) / Decimal(10 ** info["decimals"])
-                amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                asset_name = f"{info['name']} ({info['symbol']})"
-                if direction == "outgoing":
-                    asset_name = f"Sent {asset_name}"
-                alert_title = "Outgoing ERC-20 Token" if direction == "outgoing" else "Incoming ERC-20 Token"
-                alert_icon = "🟠" if direction == "outgoing" else "🟢"
-                await self._notify(cid, alert_title, alert_icon, amt_str, asset_name,
-                                   from_addr, to_addr, tx_hash, block=block, asset=asset_name, amount=amt_str,
-                                   wallet_address=watched_addr)
-                await self._mark(cid, tx_hash, li, block=block, asset=asset_name, amount=amt_str)
+                try:
+                    if await self._dedup(cid, tx_hash, li):
+                        continue
+                    info = await self.cache.get_info(self.w3, token_addr)
+                    amt = Decimal(amount) / Decimal(10 ** info["decimals"])
+                    amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
+                    asset_name = f"{info['name']} ({info['symbol']})"
+                    if direction == "outgoing":
+                        asset_name = f"Sent {asset_name}"
+                    alert_title = "Outgoing ERC-20 Token" if direction == "outgoing" else "Incoming ERC-20 Token"
+                    alert_icon = "🟠" if direction == "outgoing" else "🟢"
+                    await self._notify(cid, alert_title, alert_icon, amt_str, asset_name,
+                                       from_addr, to_addr, tx_hash, block=block,
+                                       wallet_address=watched_addr)
+                    await self._mark(cid, tx_hash, li, block=block, asset=asset_name, amount=amt_str)
+                except Exception as exc:
+                    # A single bad notification must never block state advancement
+                    # for the rest of the batch (that's what caused this bug).
+                    logger.error("%s ERC-20 notify failed for tx %s (chat %s): %s", self.key, tx_hash, cid, exc)
 
     async def _scan_native(self, f: int, t: int, addr_set: set):
         for n in range(f, t + 1):
@@ -558,18 +566,23 @@ class EVMMonitor(BaseMonitor):
                 users = await self.db.fetchall("SELECT chat_id FROM addresses WHERE chain='evm' AND LOWER(address)=?", (watched_addr.lower(),))
                 for u in users:
                     cid = u["chat_id"]
-                    if await self._dedup(cid, tx_hash, -1):
-                        continue
-                    amt = Decimal(tx["value"]) / Decimal(10 ** 18)
-                    amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
-                    if direction == "outgoing":
-                        amt_str = f"- {amt_str}"
-                    alert_title = "Outgoing Native Transfer" if direction == "outgoing" else "Incoming Native Transfer"
-                    alert_icon = "🟠" if direction == "outgoing" else "⬇️"
-                    await self._notify(cid, alert_title, alert_icon, amt_str, self.cfg["native"],
-                                       from_addr, to, tx_hash, block=n, asset=self.cfg["native"], amount=amt_str,
-                                       wallet_address=watched_addr)
-                    await self._mark(cid, tx_hash, -1, block=n, asset=self.cfg["native"], amount=amt_str)
+                    try:
+                        if await self._dedup(cid, tx_hash, -1):
+                            continue
+                        amt = Decimal(tx["value"]) / Decimal(10 ** 18)
+                        amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
+                        if direction == "outgoing":
+                            amt_str = f"- {amt_str}"
+                        alert_title = "Outgoing Native Transfer" if direction == "outgoing" else "Incoming Native Transfer"
+                        alert_icon = "🟠" if direction == "outgoing" else "⬇️"
+                        await self._notify(cid, alert_title, alert_icon, amt_str, self.cfg["native"],
+                                           from_addr, to, tx_hash, block=n,
+                                           wallet_address=watched_addr)
+                        await self._mark(cid, tx_hash, -1, block=n, asset=self.cfg["native"], amount=amt_str)
+                    except Exception as exc:
+                        # A single bad notification must never block state advancement
+                        # for the rest of the batch (that's what caused this bug).
+                        logger.error("%s native notify failed for tx %s (chat %s): %s", self.key, tx_hash, cid, exc)
 
 
 # ═══════════════════════════════════════════════════
@@ -630,7 +643,7 @@ class TONMonitor(BaseMonitor):
                             amt = Decimal(amount) / Decimal(10 ** self.cfg["decimals"])
                             amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
                             await self._notify(cid, "Incoming TON Transfer", "⬇️", amt_str, self.cfg["native"],
-                                               sender, addr, event_id, memo=memo, asset=self.cfg["native"], amount=amt_str)
+                                               sender, addr, event_id, memo=memo)
                             await self._mark(cid, event_id, memo=memo, asset=self.cfg["native"], amount=amt_str)
                     elif act_type == "JettonTransfer":
                         jet_tx = action.get("JettonTransfer", {})
@@ -655,7 +668,7 @@ class TONMonitor(BaseMonitor):
                             amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
                             asset_name = f"{token_name} ({token_symbol})"
                             await self._notify(cid, "Incoming Jetton Token", "🟢", amt_str, asset_name,
-                                               sender, addr, event_id, memo=memo, asset=asset_name, amount=amt_str)
+                                               sender, addr, event_id, memo=memo)
                             await self._mark(cid, event_id, memo=memo, asset=asset_name, amount=amt_str)
         await asyncio.sleep(self.cfg["poll"])
 
@@ -738,7 +751,7 @@ class XLMMonitor(BaseMonitor):
                     title = "Incoming XLM Payment" if asset == "XLM" else "Incoming Stellar Asset"
                     icon = "⬇️" if asset == "XLM" else "🟢"
                     await self._notify(cid, title, icon, amt_str, asset,
-                                       rec.get("from", "?"), addr, tx_hash, memo=memo, asset=asset, amount=amt_str)
+                                       rec.get("from", "?"), addr, tx_hash, memo=memo)
                     await self._mark(cid, tx_hash, memo=memo, asset=asset, amount=amt_str)
         await asyncio.sleep(self.cfg["poll"])
 
@@ -825,7 +838,7 @@ class SOLMonitor(BaseMonitor):
                         amt = Decimal(diff) / Decimal(10 ** self.cfg["decimals"])
                         amt_str = f"{amt:,.9f}".rstrip("0").rstrip(".")
                         await self._notify(cid, "Incoming SOL Transfer", "⬇️", amt_str, self.cfg["native"],
-                                           "Network", addr, sig, memo=memo, asset=self.cfg["native"], amount=amt_str)
+                                           "Network", addr, sig, memo=memo)
                         await self._mark(cid, sig, memo=memo, asset=self.cfg["native"], amount=amt_str)
                 pre_tokens = {tb["accountIndex"]: tb for tb in meta.get("preTokenBalances", []) if tb.get("owner") == addr}
                 post_tokens = {tb["accountIndex"]: tb for tb in meta.get("postTokenBalances", []) if tb.get("owner") == addr}
@@ -849,7 +862,7 @@ class SOLMonitor(BaseMonitor):
                         if await self._dedup(cid, sig):
                             continue
                         await self._notify(cid, "Incoming SPL Token", "🟢", amt_str, asset_name,
-                                           "Network", addr, sig, memo=memo, asset=asset_name, amount=amt_str)
+                                           "Network", addr, sig, memo=memo)
                         await self._mark(cid, sig, memo=memo, asset=asset_name, amount=amt_str)
         await asyncio.sleep(self.cfg["poll"])
 
@@ -901,7 +914,7 @@ class TRONMonitor(BaseMonitor):
                     amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
                     from_addr = param.get("owner_address", "?")
                     await self._notify(cid, "Incoming TRX Transfer", "⬇️", amt_str, self.cfg["native"],
-                                       from_addr, addr, tx_hash, asset=self.cfg["native"], amount=amt_str)
+                                       from_addr, addr, tx_hash)
                     await self._mark(cid, tx_hash, asset=self.cfg["native"], amount=amt_str)
             try:
                 resp = await self.client.get(f"{self.cfg['api']}/accounts/{addr}/transactions/trc20", params={"limit": 10, "order_by": "block_timestamp,desc"})
@@ -930,7 +943,7 @@ class TRONMonitor(BaseMonitor):
                     from_addr = tx.get("from", "?")
                     asset_name = f"{name} ({symbol})"
                     await self._notify(cid, "Incoming TRC-20 Token", "🟢", amt_str, asset_name,
-                                       from_addr, addr, tx_hash, asset=asset_name, amount=amt_str)
+                                       from_addr, addr, tx_hash)
                     await self._mark(cid, tx_hash, asset=asset_name, amount=amt_str)
         await asyncio.sleep(self.cfg["poll"])
 
@@ -986,7 +999,7 @@ class BTCMonitor(BaseMonitor):
                     if vins:
                         sender = vins[0].get("prevout", {}).get("scriptpubkey_address", "Unknown")
                     await self._notify(cid, "Incoming BTC Transfer", "⬇️", amt_str, self.cfg["native"],
-                                       sender, addr, tx_hash, asset=self.cfg["native"], amount=amt_str)
+                                       sender, addr, tx_hash)
                     await self._mark(cid, tx_hash, asset=self.cfg["native"], amount=amt_str)
         await asyncio.sleep(self.cfg["poll"])
 
@@ -1055,7 +1068,7 @@ class SUIMonitor(BaseMonitor):
                 if await self._dedup(chat_id, digest, log_index):
                     continue
                 await self._notify(chat_id, "Incoming Sui Transfer", "🟢", amount_str, symbol,
-                                   sender, address, digest, asset=symbol, amount=amount_str)
+                                   sender, address, digest)
                 await self._mark(chat_id, digest, log_index=log_index, asset=symbol, amount=amount_str)
 
 
@@ -1122,6 +1135,51 @@ def validate_address(chain: str, address: str) -> bool:
     elif chain == "sui":
         return bool(re.fullmatch(r"0x[0-9a-fA-F]{1,64}", address))
     return False
+
+
+TELEGRAM_MAX_LEN = 4096
+
+
+def _chunk_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> List[str]:
+    """Split text into Telegram-safe chunks, breaking on blank-line boundaries
+    so a single entry (one address, one history row) is never cut mid-way."""
+    if len(text) <= limit:
+        return [text]
+    chunks: List[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        piece = block + "\n\n"
+        if len(current) + len(piece) > limit:
+            if current:
+                chunks.append(current.rstrip("\n"))
+                current = ""
+            # A single block larger than the whole limit still has to split.
+            while len(piece) > limit:
+                chunks.append(piece[:limit])
+                piece = piece[limit:]
+        current += piece
+    if current.strip():
+        chunks.append(current.rstrip("\n"))
+    return chunks
+
+
+async def send_long(message: types.Message, text: str, **kwargs):
+    """message.answer() that transparently splits output over Telegram's
+    4096-character limit instead of raising and leaving the user with no
+    response at all (see /history, /export, /list, /report)."""
+    for chunk in _chunk_text(text):
+        await message.answer(chunk, **kwargs)
+
+
+async def send_long_callback(callback: types.CallbackQuery, text: str, reply_markup=None, **kwargs):
+    """Same as send_long, but edits the callback's existing message for the
+    first chunk (matching normal inline-menu behavior) and sends any
+    overflow as follow-up messages."""
+    chunks = _chunk_text(text)
+    await callback.message.edit_text(chunks[0], reply_markup=reply_markup if len(chunks) == 1 else None, **kwargs)
+    for chunk in chunks[1:]:
+        is_last = chunk == chunks[-1]
+        await callback.message.answer(chunk, reply_markup=reply_markup if is_last else None, **kwargs)
 
 
 # ── /start ─────────────────────────────────────────
@@ -1206,7 +1264,7 @@ async def cb_menu_list(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Back", callback_data="menu_back")]
     ])
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await send_long_callback(callback, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data == "menu_history")
@@ -1287,7 +1345,9 @@ async def cb_menu_help(callback: types.CallbackQuery):
         "<b>📖 Help</b>\n\n"
         "<b>/add</b> <code>&lt;chain&gt; &lt;address&gt; [label]</code>\n"
         "<b>/remove</b> <code>&lt;chain&gt; &lt;address&gt;</code>\n"
-        "<b>/list</b> — Show your addresses\n"
+        "<b>/rename</b> <code>&lt;chain&gt; &lt;address&gt; &lt;label&gt;</code>\n"
+        "<b>/list</b> [chain] — Show your addresses\n"
+        "<b>/report</b> — Wallets with alert counts\n"
         "<b>/history</b> [limit] — Notification history\n"
         "<b>/clearhistory</b> — Clear history\n"
         "<b>/pause</b> — Pause notifications\n"
@@ -1295,6 +1355,7 @@ async def cb_menu_help(callback: types.CallbackQuery):
         "<b>/timezone</b> <code>&lt;zone&gt;</code> — Set timezone\n"
         "<b>/stats</b> — Your stats\n"
         "<b>/status</b> — Monitor health and active networks\n"
+        "<b>/test</b> — Send a sample alert\n"
         "<b>/export</b> — Export addresses\n"
         "<b>/chains</b> — Supported chains\n"
         "<b>/help</b> — This message\n\n"
@@ -1355,6 +1416,11 @@ async def cmd_add(message: types.Message):
     if label and len(label) > 80:
         await message.answer("❌ Label must be 80 characters or fewer.", parse_mode=ParseMode.HTML)
         return
+    # Sanitize once at the boundary: an unescaped '<', '>' or '&' in a label
+    # would break every future HTML-parsed message that includes it --
+    # /list, /rename confirmations, wallet reports, and real transfer alerts.
+    if label:
+        label = html_lib.escape(label, quote=False)
 
     chain = "evm" if chain_input in CHAINS and CHAINS[chain_input].get("type") == "evm" else chain_input
 
@@ -1394,7 +1460,7 @@ async def cmd_add(message: types.Message):
     )
 
 
-# ── /remove ────────────────────────────────────────
+# ── /rename ────────────────────────────────────────
 
 @router.message(Command("rename"))
 async def cmd_rename(message: types.Message):
@@ -1410,6 +1476,8 @@ async def cmd_rename(message: types.Message):
     if not label or len(label) > 80:
         await message.answer("❌ Label must contain 1–80 characters.", parse_mode=ParseMode.HTML)
         return
+    # Sanitize once at the boundary -- see /add for why this matters.
+    label = html_lib.escape(label, quote=False)
     cur = await db.execute(
         "UPDATE addresses SET label=? WHERE chat_id=? AND chain=? AND LOWER(address)=?",
         (label, message.chat.id, chain, address.lower()),
@@ -1422,9 +1490,29 @@ async def cmd_rename(message: types.Message):
 
 @router.message(Command("test"))
 async def cmd_test(message: types.Message):
+    chat_id = message.chat.id
+    sample_cfg = CHAINS["base"]
+    # Mirrors BaseMonitor._notify()'s exact template, so this doubles as a
+    # real check that HTML formatting, emoji, and links render correctly --
+    # not just that *a* message can be sent.
+    sample = (
+        f"<b>⬇️ Incoming Native Transfer</b>\n\n"
+        f"<b>{sample_cfg['emoji']} {sample_cfg['name']}</b>\n"
+        f"<b>💰 Amount:</b> <code>0.05 ETH</code>\n"
+        f"<b>📤 From:</b> <code>0x000000000000000000000000000000000000dEaD</code>\n"
+        f"<b>📥 To:</b> <code>0xYourWalletAddressHere00000000000000</code> <i>(Sample)</i>\n"
+        f"<b>📦 Block:</b> <code>0</code>\n"
+        f"<b>🔗 Tx:</b> <code>0xsample000000000000000000000000000000000000000000000000000000</code>\n"
+        f"<b>⏰ Time:</b> <code>{fmt_time(db, chat_id)}</code>"
+    )
     await message.answer(
-        "✅ <b>Test notification delivered.</b>\n\nTelegram messaging is working correctly.",
+        "✅ <b>This is a sample alert</b> — it is NOT a real transfer.\n\n" + sample +
+        "\n\n<i>If this rendered cleanly, Telegram delivery is working. "
+        "Real alerts fire automatically when a monitored wallet moves funds — "
+        "check /status to confirm the relevant chain is online and /list to "
+        "confirm the address is actually being watched.</i>",
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -1531,11 +1619,12 @@ async def cmd_list(message: types.Message):
             text += f"\n{emoji} <b>{name}</b>\n"
         a = r["address"]
         lab = r["label"] or "No Label"
-        short = f"{a[:10]}...{a[-6:]}" if len(a) > 20 else a
-        text += f"  ├ <code>{short}</code> — <i>{lab}</i>\n"
+        # Full address, not truncated: a "..." in a <code> block is not
+        # copyable into a wallet or explorer, which defeats the point.
+        text += f"  ├ <code>{a}</code> — <i>{lab}</i>\n"
     count = len(rows)
     text += f"\n<i>Total: {count} address(es) monitored</i>"
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await send_long(message, text, parse_mode=ParseMode.HTML)
 
 
 # ── /history ───────────────────────────────────────
@@ -1580,7 +1669,7 @@ async def cmd_history(message: types.Message):
             f"{i}. {emoji} <code>{r['asset']}</code> | <code>{r['amount']}</code>\n"
             f"   └ <a href='{cfg.get('explorer', '')}{r['tx_hash']}'>{tx_short}</a> | {time_str}\n\n"
         )
-    await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await send_long(message, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ── /clearhistory ──────────────────────────────────
@@ -1750,7 +1839,7 @@ async def cmd_wallet_report(message: types.Message):
         short = row["address"]
         text += f"  <code>{short}</code> — <i>{row['label'] or 'No label'}</i> — {alert_count['c']} alert(s)\n"
     text += "\n<i>Use /list for addresses or /rename to update labels.</i>"
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await send_long(message, text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("stats"))
@@ -1806,29 +1895,48 @@ async def cmd_export(message: types.Message):
         lines.append(f"[{name}] {r['address']}  # {r['label'] or 'No Label'}")
 
     text = "\n".join(lines)
-    await message.answer(
-        f"<b>📤 Export</b>\n\n<pre>{text}</pre>\n\n"
-        f"<i>Copy the text above to back up your addresses.</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    header = "<b>📤 Export</b>\n\n"
+    footer = "\n\n<i>Copy the text above to back up your addresses.</i>"
+    wrapper_overhead = len(header) + len(footer) + len("<pre></pre>")
+    # Chunk the raw lines first, then wrap each chunk in its own <pre> tags --
+    # splitting an already-wrapped block would leave an unmatched <pre>/</pre>
+    # in whichever message got cut, breaking HTML parsing for that message.
+    line_chunks = _chunk_text(text, limit=TELEGRAM_MAX_LEN - wrapper_overhead)
+    for i, chunk in enumerate(line_chunks):
+        piece = f"<pre>{chunk}</pre>"
+        if i == 0:
+            piece = header + piece
+        if i == len(line_chunks) - 1:
+            piece = piece + footer
+        await message.answer(piece, parse_mode=ParseMode.HTML)
 
 
 # ── /chains ────────────────────────────────────────
 
 @router.message(Command("chains"))
 async def cmd_chains(message: types.Message):
+    evm_chains = [(k, c) for k, c in CHAINS.items() if c.get("type") == "evm"]
+    other_chains = [(k, c) for k, c in CHAINS.items() if c.get("type") != "evm"]
+
     text = "<b>⛓️ Supported Chains</b>\n\n"
-    text += "⛓️ <b>EVM (all at once)</b> — <code>evm</code> — <i>All ERC-20s detected</i>\n"
-    for k, c in CHAINS.items():
-        if c.get("type") != "evm":
-            note = ""
-            if k == "ton": note = " — <i>Native + All Jettons</i>"
-            elif k == "xlm": note = " — <i>Native + All Assets</i>"
-            elif k == "sol": note = " — <i>Native + All SPLs</i>"
-            elif k == "tron": note = " — <i>Native + All TRC-20s</i>"
-            elif k == "btc": note = " — <i>Native BTC only</i>"
-            text += f"{c['emoji']} <b>{c['name']}</b> — <code>{k}</code> — <code>{c['native']}</code>{note}\n"
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    text += (
+        f"<b>⛓️ EVM</b> — add once with <code>/add evm &lt;address&gt;</code>, "
+        f"monitored across all {len(evm_chains)} networks below:\n"
+    )
+    text += ", ".join(f"{c['emoji']} {c['name']}" for _, c in evm_chains) + "\n"
+    text += "<i>All ERC-20 tokens (USDT, USDC, etc.) detected automatically on each.</i>\n\n"
+
+    text += "<b>Other networks</b> — add individually by key:\n"
+    for k, c in other_chains:
+        note = ""
+        if k == "ton": note = " — <i>Native + All Jettons</i>"
+        elif k == "xlm": note = " — <i>Native + All Assets</i>"
+        elif k == "sol": note = " — <i>Native + All SPLs</i>"
+        elif k == "tron": note = " — <i>Native + All TRC-20s</i>"
+        elif k == "btc": note = " — <i>Native BTC only</i>"
+        elif k == "sui": note = " — <i>Native + All Move Coins</i>"
+        text += f"{c['emoji']} <b>{c['name']}</b> — <code>{k}</code> — <code>{c['native']}</code>{note}\n"
+    await send_long(message, text, parse_mode=ParseMode.HTML)
 
 
 # ── /help ──────────────────────────────────────────
@@ -1841,7 +1949,10 @@ async def cmd_help(message: types.Message):
         "  └ Monitor a new address\n"
         "<b>🗑️ /remove</b> <code>&lt;chain&gt; &lt;address&gt;</code>\n"
         "  └ Stop monitoring (or tap to remove inline)\n"
-        "<b>📋 /list</b> — Show all monitored addresses\n"
+        "<b>✏️ /rename</b> <code>&lt;chain&gt; &lt;address&gt; &lt;label&gt;</code>\n"
+        "  └ Change an address's label\n"
+        "<b>📋 /list</b> [chain] — Show monitored addresses\n"
+        "<b>👛 /report</b> — Wallets with per-address alert counts\n"
         "<b>📜 /history</b> [limit] — Show notification history (max 50)\n"
         "<b>🗑️ /clearhistory</b> — Clear all history\n"
         "<b>🔕 /pause</b> — Pause notifications\n"
@@ -1849,6 +1960,7 @@ async def cmd_help(message: types.Message):
         "<b>🌍 /timezone</b> <code>&lt;zone&gt;</code> — Set local timezone\n"
         "<b>📊 /stats</b> — Your monitoring statistics\n"
         "<b>📊 /status</b> — Monitor health and active networks\n"
+        "<b>🧪 /test</b> — Send a sample alert to check formatting/delivery\n"
         "<b>📤 /export</b> — Export addresses as text\n"
         "<b>⛓️ /chains</b> — List supported chains\n"
         "<b>❓ /help</b> — This message\n\n"
@@ -1858,6 +1970,39 @@ async def cmd_help(message: types.Message):
         "<i>💡 Notifications use YOUR local timezone.</i>",
         parse_mode=ParseMode.HTML,
     )
+
+
+# ── Global error handler ────────────────────────────
+# Without this, any unhandled exception in a command or callback handler
+# (bad input we didn't anticipate, a transient Telegram API error, a
+# message that turned out too long, etc.) results in the user getting
+# absolutely no response and no indication anything went wrong.
+# `bot: Bot` is injected automatically by aiogram's dependency system,
+# the same way it is for ordinary message/callback handlers.
+
+@router.errors()
+async def on_error(event: types.ErrorEvent, bot: Bot):
+    update = event.update
+    chat = None
+    if update.message:
+        chat = update.message.chat
+    elif update.callback_query and update.callback_query.message:
+        chat = update.callback_query.message.chat
+
+    logger.error("Handler error on update %s: %s", update.update_id, event.exception, exc_info=event.exception)
+
+    if chat is not None:
+        try:
+            await bot.send_message(
+                chat.id,
+                "⚠️ <b>Something went wrong processing that.</b>\n\n"
+                "It's been logged. Please try again, and if it keeps happening, "
+                "double-check your command with /help.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass  # Don't let a failure in the error handler itself raise.
+    return True
 
 
 # ═══════════════════════════════════════════════════
