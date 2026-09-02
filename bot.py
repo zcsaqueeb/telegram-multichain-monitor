@@ -89,8 +89,6 @@ class _RedactFilter(logging.Filter):
                 or rec.getMessage().startswith("client_session:")
                 or "Successfully disconnected from:" in rec.getMessage()):
             return False
-        if rec.levelno == logging.WARNING:
-            return False
         rec.msg = self._url_pat.sub("[rpc]", self._id_pat.sub("id=***", rec.getMessage()))
         rec.args = ()
         return True
@@ -1011,7 +1009,13 @@ class XLMMonitor(Monitor):
             st = await self.db.fetchone("SELECT last_state FROM chain_state WHERE chain=?", (f"xlm_{addr}",))
             if st and st["last_state"]:
                 cursor = st["last_state"]
-            params = {"order": "desc", "limit": 10}
+            # First poll (no cursor yet): desc with no cursor grabs the most
+            # recent N to establish a starting point. Every poll after that
+            # must walk FORWARD from the last-seen cursor (order=asc) to
+            # discover new activity -- order=desc+cursor walks backward into
+            # older, already-seen history and would never surface anything
+            # that happened after the bot started watching this address.
+            params = {"limit": 10, "order": "asc" if cursor else "desc"}
             if cursor:
                 params["cursor"] = cursor
             try:
@@ -1054,7 +1058,10 @@ class XLMMonitor(Monitor):
                     contract_addr=rec.get("asset_issuer") if atype != "native" else None,
                 ))
             if records:
-                await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (f"xlm_{addr}", records[0].get("paging_token")))
+                # asc -> records are oldest-first, so the newest fetched is the
+                # LAST one. desc (first poll only) -> newest is the FIRST one.
+                newest = records[-1] if cursor else records[0]
+                await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (f"xlm_{addr}", newest.get("paging_token")))
         await self._send_batch(alerts)
         await asyncio.sleep(self.cfg.poll)
 
@@ -1247,7 +1254,11 @@ class TRONMonitor(Monitor):
             addr = r["address"]
             # Native TRX
             try:
-                data = (await self._client.get(f"{self.cfg.api}/accounts/{addr}/transactions", params={"limit": 10, "order_by": "block_timestamp,desc"})).json()
+                # visible=true is required: TronGrid returns to_address/owner_address
+                # in hex format (41-prefixed) by default, which never equals our
+                # stored base58 address -- silently breaking ALL native TRX
+                # detection (both directions) without visible=true.
+                data = (await self._client.get(f"{self.cfg.api}/accounts/{addr}/transactions", params={"limit": 10, "order_by": "block_timestamp,desc", "visible": "true"})).json()
             except Exception as exc:
                 logger.debug("TRON native: %s", exc)
                 data = {"data": []}
@@ -1431,18 +1442,33 @@ class SUIMonitor(Monitor):
         alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
-            try:
-                result = await self._rpc("suix_queryTransactionBlocks", [{"ToAddress": addr}, {
-                    "showInput": True, "showEffects": True, "showBalanceChanges": True,
-                }, None, 50, True])
-            except Exception as exc:
-                logger.debug("SUI RPC: %s", exc)
-                continue
-            for tx in result.get("data", []):
-                digest = tx.get("digest")
-                if not digest:
+            # Sui's query filter is directional: ToAddress only returns txs
+            # where addr received something, FromAddress only where addr is
+            # the sender. A ToAddress-only query (the original approach) can
+            # never surface outgoing transfers -- addr never appears in that
+            # result set at all when it's purely the sender.
+            seen_digests: Set[str] = set()
+            txs: List[dict] = []
+            for query_filter in ({"ToAddress": addr}, {"FromAddress": addr}):
+                try:
+                    result = await self._rpc("suix_queryTransactionBlocks", [query_filter, {
+                        "showInput": True, "showEffects": True, "showBalanceChanges": True,
+                    }, None, 50, True])
+                except Exception as exc:
+                    logger.debug("SUI RPC: %s", exc)
                     continue
-                for i, change in enumerate(tx.get("balanceChanges") or []):
+                for tx in result.get("data", []):
+                    digest = tx.get("digest")
+                    if not digest or digest in seen_digests:
+                        continue
+                    seen_digests.add(digest)
+                    txs.append(tx)
+
+            for tx in txs:
+                digest = tx.get("digest")
+                changes = tx.get("balanceChanges") or []
+                sender = (tx.get("transaction", {}).get("data", {}) or {}).get("sender", "Unknown")
+                for i, change in enumerate(changes):
                     owner = change.get("owner")
                     oa = owner.get("AddressOwner") if isinstance(owner, dict) else owner
                     if not oa or oa.lower() != addr.lower():
@@ -1456,12 +1482,26 @@ class SUIMonitor(Monitor):
                     dec = self.cfg.decimals if is_sui else 9
                     sym = self.cfg.native if is_sui else ctype.rsplit("::", 1)[-1].upper()
                     a = Decimal(abs(raw)) / Decimal(10 ** dec)
-                    sender = (tx.get("transaction", {}).get("data", {}) or {}).get("sender", "Unknown")
+                    if direction == Direction.OUT:
+                        # Best-effort counterparty: another owner whose balance
+                        # for the same coin type moved the opposite direction.
+                        recipient = "Unknown"
+                        for other in changes:
+                            if other is change or other.get("coinType", "0x2::sui::SUI") != ctype:
+                                continue
+                            oo = other.get("owner")
+                            ooa = oo.get("AddressOwner") if isinstance(oo, dict) else oo
+                            if ooa and ooa.lower() != addr.lower() and int(other.get("amount", "0")) > 0:
+                                recipient = ooa
+                                break
+                        from_a, to_a = addr, recipient
+                    else:
+                        from_a, to_a = sender, addr
                     alerts.append(Alert(
                         chat_id=r["chat_id"], chain_key=self.key,
                         title="Outgoing Sui" if direction == Direction.OUT else "Incoming Sui",
                         amount_str=f"{a:,.9f}".rstrip("0").rstrip("."),
-                        asset=sym, from_addr=sender, to_addr=addr,
+                        asset=sym, from_addr=from_a, to_addr=to_a,
                         tx_hash=digest, direction=direction, log_index=i,
                         contract_addr=None if is_sui else ctype,
                     ))
