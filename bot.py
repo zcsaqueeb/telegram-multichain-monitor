@@ -75,6 +75,10 @@ class Config:
     NOTIF_BATCH: int = 100
     ADDR_CACHE_TTL: int = 30  # seconds
     USER_CACHE_TTL: int = 60  # seconds
+    RPC_TIMEOUT: int = int(os.getenv("RPC_TIMEOUT", "20"))
+    EVM_MAX_BLOCKS: int = int(os.getenv("EVM_MAX_BLOCKS", "10"))
+    ADDR_TOPIC_CHUNK: int = 50  # addresses per eth_getLogs topic filter
+    IDLE_POLL: int = int(os.getenv("IDLE_POLL", "30"))  # poll gap when a chain has no wallets
 
 # ═══════════════════════════════════════════════════
 # LOGGING
@@ -133,9 +137,9 @@ class ChainCfg:
     chain_id: Optional[int] = None
 
 _CHAINS: List[ChainCfg] = [
-    ChainCfg("ethereum",  "Ethereum",   "💠", "evm", "ETH",  15, "https://eth.llamarpc.com",                    ("https://ethereum.publicnode.com","https://1rpc.io/eth","https://rpc.flashbots.net"),                   "", "https://etherscan.io/tx/"),
-    ChainCfg("bsc",       "BSC",        "🟡", "evm", "BNB",   3, "https://bsc-dataseed.binance.org/",           ("https://bsc.publicnode.com","https://1rpc.io/bnb"),                                                   "", "https://bscscan.com/tx/"),
-    ChainCfg("polygon",   "Polygon",    "🟣", "evm", "MATIC", 2, "https://polygon.llamarpc.com",                ("https://polygon.drpc.org","https://polygon.publicnode.com","https://1rpc.io/matic"),                  "", "https://polygonscan.com/tx/"),
+    ChainCfg("ethereum",  "Ethereum",   "💠", "evm", "ETH",  15, "https://ethereum-rpc.publicnode.com",               ("https://eth.llamarpc.com","https://1rpc.io/eth","https://rpc.flashbots.net","https://ethereum.publicnode.com"),                   "", "https://etherscan.io/tx/"),
+    ChainCfg("bsc",       "BSC",        "🟡", "evm", "BNB",   3, "https://bsc-rpc.publicnode.com",                    ("https://bsc-dataseed.binance.org","https://bsc.meowrpc.com","https://1rpc.io/bnb","https://bsc.publicnode.com"),                                                   "", "https://bscscan.com/tx/"),
+    ChainCfg("polygon",   "Polygon",    "🟣", "evm", "MATIC", 2, "https://polygon-bor-rpc.publicnode.com",            ("https://polygon.drpc.org","https://polygon.llamarpc.com","https://1rpc.io/matic","https://polygon.publicnode.com"),                  "", "https://polygonscan.com/tx/"),
     ChainCfg("arbitrum",  "Arbitrum",   "🔵", "evm", "ETH",   2, "https://arb1.arbitrum.io/rpc",                ("https://arbitrum-one.publicnode.com","https://1rpc.io/arb"),                                          "", "https://arbiscan.io/tx/"),
     ChainCfg("optimism",  "Optimism",   "🔴", "evm", "ETH",   2, "https://mainnet.optimism.io",                 ("https://optimism.publicnode.com","https://1rpc.io/op"),                                               "", "https://optimistic.etherscan.io/tx/"),
     ChainCfg("base",      "Base",       "🔷", "evm", "ETH",   2, "https://mainnet.base.org",                    ("https://base.publicnode.com","https://1rpc.io/base"),                                                 "", "https://basescan.org/tx/"),
@@ -255,6 +259,16 @@ def burn_warn(chain_key: str, addr: str) -> str:
         f"Tokens sent here are permanently lost and cannot be recovered.\n\n"
         f"❌ <b>This address cannot be monitored.</b>"
     )
+
+def _decode_hex_memo(hex_str: Optional[str]) -> Optional[str]:
+    """Decode TronGrid's hex-encoded transfer data (exchange memos) to text."""
+    if not hex_str or not isinstance(hex_str, str):
+        return None
+    try:
+        text = bytes.fromhex(hex_str).decode("utf-8", errors="ignore").strip()
+    except ValueError:
+        return None
+    return text or None
 
 # ═══════════════════════════════════════════════════
 # AUTO-DELETE
@@ -483,6 +497,42 @@ class SPLCache:
             self._client = None
 
 # ═══════════════════════════════════════════════════
+# ADDRESS LIST CACHE (TTL, shared by all monitors)
+# ═══════════════════════════════════════════════════
+
+class AddrCache:
+    """Caches monitored-address lists so 25 monitors stop re-querying SQLite every poll."""
+    __slots__ = ("_db", "_ttl", "_store", "_lock")
+    def __init__(self, db: DB, ttl: int):
+        self._db = db
+        self._ttl = ttl
+        self._store: Dict[str, Tuple[List[sqlite3.Row], float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _rows(self, key: str, loader) -> List[sqlite3.Row]:
+        now = time.monotonic()
+        hit = self._store.get(key)
+        if hit and now - hit[1] < self._ttl:
+            return hit[0]
+        async with self._lock:
+            now = time.monotonic()
+            hit = self._store.get(key)
+            if hit and now - hit[1] < self._ttl:
+                return hit[0]
+            rows = await loader()
+            self._store[key] = (rows, now)
+            return rows
+
+    async def evm(self) -> List[sqlite3.Row]:
+        return await self._rows("evm", self._db.get_all_evm_addresses)
+
+    async def chain(self, key: str) -> List[sqlite3.Row]:
+        return await self._rows(key, lambda: self._db.get_addresses_by_chain(key))
+
+    def invalidate(self):
+        self._store.clear()
+
+# ═══════════════════════════════════════════════════
 # TIMEZONE (async, cached)
 # ═══════════════════════════════════════════════════
 
@@ -594,14 +644,14 @@ class Notifier:
             f"<b>{badge} {alert.title}</b>\n\n"
             f"<b>{cfg.emoji} {cfg.name}</b>\n"
             f"<b>Wallet:</b> <code>{watched_addr}</code> <i>({label})</i>\n"
-            f"<b>💰 Amount:</b> <code>{alert.amount_str} {alert.asset}</code>\n"
+            f"<b>💰 Amount:</b> <code>{alert.amount_str} {html.escape(alert.asset)}</code>\n"
             f"<b>{oe} {ol}:</b> <code>{alert.from_addr}</code>\n"
             f"<b>{de} {sl}:</b> <code>{alert.to_addr}</code> <i>({label})</i>\n"
         )
         if alert.contract_addr:
             text += f"<b>Token contract:</b> <code>{alert.contract_addr}</code>\n"
         if alert.memo:
-            text += f"<b>📝 Memo:</b> <code>{alert.memo}</code>\n"
+            text += f"<b>📝 Memo:</b> <code>{html.escape(alert.memo)}</code>\n"
         if alert.block is not None:
             text += f"<b>📦 Block:</b> <code>{alert.block}</code>\n"
         text += (
@@ -648,16 +698,29 @@ async def _close_web3(w3: Optional[AsyncWeb3]):
             logger.debug("Web3 provider close failed: %s", exc)
 
 class Monitor(ABC):
-    __slots__ = ("key", "cfg", "db", "notifier", "running")
+    __slots__ = ("key", "cfg", "db", "notifier", "running", "last_error", "last_ok", "idle_since")
     def __init__(self, key: str, cfg: ChainCfg, db: DB, notifier: Notifier):
         self.key = key
         self.cfg = cfg
         self.db = db
         self.notifier = notifier
         self.running = False
+        self.last_error: Optional[str] = None
+        self.last_ok: Optional[float] = None
+        self.idle_since: Optional[float] = None
 
     @abstractmethod
     async def run(self): ...
+
+    def health(self) -> Tuple[str, str]:
+        """(emoji, detail) for /status reporting."""
+        if not self.running:
+            return "⚪", "stopped"
+        if self.last_error:
+            return "🟡", f"retrying: {self.last_error[:120]}"
+        if self.last_ok and time.monotonic() - self.last_ok > max(self.cfg.poll * 10, Config.IDLE_POLL * 4):
+            return "🟡", "no recent scan"
+        return "🟢", "polling"
 
     async def stop(self):
         self.running = False
@@ -684,61 +747,102 @@ class EVMMonitor(Monitor):
         self._rpc_url: Optional[str] = None
         self._rpc_failures = 0
 
+    def _endpoints(self) -> Tuple[str, ...]:
+        return tuple(dict.fromkeys(e for e in (self.cfg.rpc, *self.cfg.rpc_fallbacks) if e))
+
+    async def _open(self, ep: str) -> Optional[AsyncWeb3]:
+        provider = AsyncHTTPProvider(ep, request_kwargs={"timeout": Config.RPC_TIMEOUT})
+        candidate = AsyncWeb3(provider)
+        candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        try:
+            if await candidate.is_connected():
+                return candidate
+        except Exception as exc:
+            logger.debug("%s RPC fail %s: %s", self.cfg.name, ep, exc)
+        await _close_web3(candidate)
+        return None
+
     async def _connect(self) -> bool:
-        endpoints = (self.cfg.rpc, *self.cfg.rpc_fallbacks)
-        for ep in dict.fromkeys(endpoints):
-            if not ep:
-                continue
-            provider = AsyncHTTPProvider(ep)
-            candidate = AsyncWeb3(provider)
-            candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-            try:
-                if await candidate.is_connected():
-                    self._w3 = candidate
-                    self._rpc_url = ep
-                    self._rpc_failures = 0
-                    return True
-            except Exception as exc:
-                logger.debug("%s RPC fail %s: %s", self.cfg.name, ep, exc)
-            finally:
-                if self._w3 is not candidate:
-                    await _close_web3(candidate)
+        for ep in self._endpoints():
+            w3 = await self._open(ep)
+            if w3 is not None:
+                self._w3 = w3
+                self._rpc_url = ep
+                self._rpc_failures = 0
+                self.last_error = None
+                return True
         self._w3 = None
         return False
+
+    async def _rotate(self) -> bool:
+        """Move to the next healthy RPC endpoint after a failed tick, keeping
+        the last-known-good endpoint as the final fallback."""
+        bad = self._rpc_url
+        current = self._w3
+        self._w3 = None
+        self._rpc_url = None
+        await _close_web3(current)
+        eps = self._endpoints()
+        ordered = [e for e in eps if e != bad] + [e for e in eps if e == bad]
+        for ep in ordered:
+            w3 = await self._open(ep)
+            if w3 is not None:
+                self._w3 = w3
+                self._rpc_url = ep
+                self.last_error = None
+                return True
+        return False
+
+    def health(self) -> Tuple[str, str]:
+        if not self.running:
+            return "⚪", "stopped"
+        if self._w3 is None:
+            return "🔴", self.last_error or "connecting…"
+        return super().health()
 
     async def run(self):
         self.running = True
         while self.running:
             if self._w3 is None and not await self._connect():
                 self._rpc_failures += 1
+                self.last_error = "all RPC endpoints unreachable"
+                delay = min(10 * (2 ** min(self._rpc_failures, 5)), 300)
                 if self._rpc_failures == 1 or self._rpc_failures % 10 == 0:
-                    delay = min(30 * (2 ** min(self._rpc_failures - 1, 3)), 300)
                     logger.error("❌ %s all RPC down, retry in %ss", self.cfg.name, delay)
-                else:
-                    delay = min(30 * (2 ** min(self._rpc_failures - 1, 3)), 300)
                 await asyncio.sleep(delay)
                 continue
             try:
                 await self._tick()
+                self.last_ok = time.monotonic()
+                self._rpc_failures = 0
+                self.last_error = None
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                logger.warning("%s tick err: %s", self.key, exc)
-                await _close_web3(self._w3)
-                self._w3 = None
-                await asyncio.sleep(5)
+                self._rpc_failures += 1
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                logger.warning("%s tick err (%d): %s", self.key, self._rpc_failures, exc)
+                rotated = self._rpc_failures >= 2 and await self._rotate()
+                if not rotated:
+                    await _close_web3(self._w3)
+                    self._w3 = None
+                await asyncio.sleep(min(2 * self._rpc_failures, 15))
 
     async def _tick(self):
+        addrs = await addr_cache.evm()
         current = await self._w3.eth.block_number
+        if not addrs:
+            # No wallets yet: keep the cursor fresh, then back off hard
+            # instead of burning an RPC round-trip every few seconds.
+            await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (self.key, str(current)))
+            await asyncio.sleep(Config.IDLE_POLL)
+            return
         row = await self.db.fetchone("SELECT last_state FROM chain_state WHERE chain=?", (self.key,))
         last = int(row["last_state"]) if row and row["last_state"] else current - 1
         if current <= last:
             await asyncio.sleep(self.cfg.poll)
             return
-        fblock, tblock = last + 1, min(current, last + 10)
-        addrs = await self.db.get_all_evm_addresses()
-        if not addrs:
-            await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (self.key, str(tblock)))
-            await asyncio.sleep(self.cfg.poll)
-            return
+        fblock, tblock = last + 1, min(current, last + Config.EVM_MAX_BLOCKS)
 
         addr_set = {r["address"].lower(): r for r in addrs}
         delivered = await asyncio.gather(
@@ -753,37 +857,62 @@ class EVMMonitor(Monitor):
         await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (self.key, str(tblock)))
         await asyncio.sleep(self.cfg.poll)
 
-    async def _scan_erc20(self, f: int, t: int, addr_map: Dict[str, sqlite3.Row]) -> bool:
+    @staticmethod
+    def _topic(addr: str) -> str:
+        return "0x" + addr[2:].lower().rjust(64, "0")
+
+    async def _logs_range(self, f: int, t: int, topics: list) -> List[dict]:
+        """Fetch matching logs, splitting the block range when an RPC rejects it."""
         try:
-            logs = await self._w3.eth.get_logs({"fromBlock": f, "toBlock": t, "topics": [TRANSFER_TOPIC]})
+            return await self._w3.eth.get_logs({"fromBlock": f, "toBlock": t, "topics": topics})
         except Exception as exc:
             if t > f:
                 m = (f + t) // 2
-                results = await asyncio.gather(
-                    self._scan_erc20(f, m, addr_map),
-                    self._scan_erc20(m + 1, t, addr_map),
+                left, right = await asyncio.gather(
+                    self._logs_range(f, m, topics),
+                    self._logs_range(m + 1, t, topics),
                 )
-                return all(results)
+                return left + right
+            logger.debug("%s getLogs blk %s fail: %s", self.cfg.name, f, exc)
             raise
 
-        # Group by tx_hash for batch dedup
+    async def _scan_erc20(self, f: int, t: int, addr_map: Dict[str, sqlite3.Row]) -> bool:
+        # Filter Transfer logs by the monitored addresses (topic[1]=from,
+        # topic[2]=to). Unfiltered chain-wide eth_getLogs are rejected by
+        # public BSC RPCs ("limit exceeded" / "specify an address"), which
+        # failed every tick and kept the monitor in a reconnect loop; the
+        # filter also shrinks payloads and parsing cost dramatically.
+        padded = [self._topic(a) for a in addr_map]
+        chunks = [padded[i:i + Config.ADDR_TOPIC_CHUNK] for i in range(0, len(padded), Config.ADDR_TOPIC_CHUNK)]
+        specs: List[list] = []
+        for ch in chunks:
+            specs.append([TRANSFER_TOPIC, None, ch])  # incoming to watched
+            specs.append([TRANSFER_TOPIC, ch, None])  # outgoing from watched
+        results = await asyncio.gather(*(self._logs_range(f, t, sp) for sp in specs))
+
         tx_items: Dict[str, List[dict]] = defaultdict(list)
-        for log in logs:
-            if len(log["topics"]) < 3:
-                continue
-            fr = "0x" + log["topics"][1].hex()[-40:]
-            to = "0x" + log["topics"][2].hex()[-40:]
-            fr_w = fr.lower() in addr_map
-            to_w = to.lower() in addr_map
-            if not fr_w and not to_w:
-                continue
-            data = log["data"].hex() if isinstance(log["data"], bytes) else log["data"]
-            tx_hash = log["transactionHash"].hex()
-            tx_items[tx_hash].append({
-                "fr": fr, "to": to, "fr_w": fr_w, "to_w": to_w,
-                "amount": int(data, 16), "token": log["address"],
-                "li": log["logIndex"], "block": log["blockNumber"],
-            })
+        seen: Set[Tuple[str, int]] = set()
+        for logs in results:
+            for log in logs:
+                if len(log["topics"]) < 3:
+                    continue
+                tx_hash = log["transactionHash"].hex()
+                li = log["logIndex"]
+                if (tx_hash, li) in seen:  # watched-to-watched logs match both specs
+                    continue
+                seen.add((tx_hash, li))
+                fr = "0x" + log["topics"][1].hex()[-40:]
+                to = "0x" + log["topics"][2].hex()[-40:]
+                fr_w = fr.lower() in addr_map
+                to_w = to.lower() in addr_map
+                if not fr_w and not to_w:
+                    continue
+                data = log["data"].hex() if isinstance(log["data"], bytes) else log["data"]
+                tx_items[tx_hash].append({
+                    "fr": fr, "to": to, "fr_w": fr_w, "to_w": to_w,
+                    "amount": int(data, 16), "token": log["address"],
+                    "li": li, "block": log["blockNumber"],
+                })
 
         alerts: List[Alert] = []
         for tx_hash, items in tx_items.items():
@@ -791,9 +920,7 @@ class EVMMonitor(Monitor):
                 directions = []
                 if item["fr_w"]:
                     directions.append((Direction.OUT, item["fr"], item["li"]))
-                if item["to_w"] and not item["fr_w"]:
-                    directions.append((Direction.IN, item["to"], item["li"] + 100000))
-                elif item["to_w"] and item["fr_w"]:
+                if item["to_w"]:
                     directions.append((Direction.IN, item["to"], item["li"] + 100000))
 
                 for direction, watched, dedup_li in directions:
@@ -815,31 +942,41 @@ class EVMMonitor(Monitor):
 
     async def _scan_native(self, f: int, t: int, addr_map: Dict[str, sqlite3.Row]) -> bool:
         alerts: List[Alert] = []
-        for n in range(f, t + 1):
-            try:
-                blk = await self._w3.eth.get_block(n, full_transactions=True)
-            except Exception:
-                raise
-            for tx in blk.transactions:
+
+        async def _raw_block(n: int) -> Optional[dict]:
+            r = await self._w3.provider.make_request("eth_getBlockByNumber", [hex(n), True])
+            if "error" in r:
+                raise RuntimeError(f"eth_getBlockByNumber {n}: {r['error']}")
+            return r.get("result")
+
+        # Raw concurrent block fetches: sequential web3-formatted
+        # get_block(full_transactions=True) took 6-10s per BSC tick and
+        # dominated CPU time in web3's response formatters.
+        nums = range(f, t + 1)
+        blocks = await asyncio.gather(*(_raw_block(n) for n in nums))
+        for n, blk in zip(nums, blocks):
+            if not blk:
+                continue
+            for tx in blk.get("transactions", []):
                 to = tx.get("to")
                 fr = tx.get("from")
-                if not to or not fr or tx.get("value", 0) == 0:
+                raw_val = tx.get("value", "0x0")
+                value = int(raw_val, 16) if isinstance(raw_val, str) else int(raw_val)
+                if not to or not fr or value == 0:
                     continue
                 fr_w = fr.lower() in addr_map
                 to_w = to.lower() in addr_map
                 if not fr_w and not to_w:
                     continue
-                txh = tx["hash"].hex()
+                txh = tx["hash"].lower()
                 directions = []
                 if fr_w:
                     directions.append((Direction.OUT, fr, -1))
-                if to_w and not fr_w:
-                    directions.append((Direction.IN, to, -2))
-                elif to_w and fr_w:
+                if to_w:
                     directions.append((Direction.IN, to, -2))
                 for direction, watched, dli in directions:
                     chat_id = addr_map[watched.lower()]["chat_id"]
-                    amt = Decimal(tx["value"]) / Decimal(10 ** 18)
+                    amt = Decimal(value) / Decimal(10 ** 18)
                     amt_str = f"{amt:,.6f}".rstrip("0").rstrip(".")
                     title = "Outgoing Native" if direction == Direction.OUT else "Incoming Native"
                     alerts.append(Alert(
@@ -887,25 +1024,30 @@ class TONMonitor(Monitor):
         while self.running:
             try:
                 await self._tick(headers)
+                self.last_ok = time.monotonic()
+                self.last_error = None
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                 logger.exception("TON: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self, headers: dict):
-        rows = await self.db.get_addresses_by_chain("ton")
+        rows = await addr_cache.chain("ton")
         if not rows:
-            await asyncio.sleep(self.cfg.poll)
+            await asyncio.sleep(Config.IDLE_POLL)
             return
         alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
             try:
                 resp = await self._client.get(f"{self.cfg.api}/accounts/{addr}/events", params={"limit": 20}, headers=headers)
+                resp.raise_for_status()
                 data = resp.json()
             except Exception as exc:
+                self.last_error = f"tonapi: {str(exc)[:160]}"
                 logger.debug("TON API %s: %s", addr, exc)
                 continue
-            for event_index, event in enumerate(data.get("events", [])):
+            for event in data.get("events", []):
                 eid = event.get("event_id")
                 if not eid:
                     continue
@@ -930,7 +1072,7 @@ class TONMonitor(Monitor):
                             from_addr=addr if direction == Direction.OUT else sender,
                             to_addr=rcpt if direction == Direction.OUT else addr,
                             tx_hash=eid, direction=direction, memo=t.get("comment"),
-                            log_index=event_index * 1000 + action_index,
+                            log_index=action_index,
                         ))
                     elif atype == "JettonTransfer":
                         t = action.get("JettonTransfer", {})
@@ -954,7 +1096,7 @@ class TONMonitor(Monitor):
                             to_addr=rcpt if direction == Direction.OUT else addr,
                             tx_hash=eid,
                             direction=direction, memo=t.get("comment"),
-                            log_index=event_index * 1000 + action_index,
+                            log_index=action_index,
                             contract_addr=jet.get("address") or jet.get("master"),
                         ))
         await self._send_batch(alerts)
@@ -993,16 +1135,36 @@ class XLMMonitor(Monitor):
         while self.running:
             try:
                 await self._tick()
+                self.last_ok = time.monotonic()
+                self.last_error = None
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                 logger.exception("XLM: %s", exc)
                 await asyncio.sleep(5)
 
+    async def _fetch_memo(self, txh: str) -> Optional[str]:
+        try:
+            td = (await self._client.get(f"{self.cfg.api}/transactions/{txh}")).json()
+            mtype = td.get("memo_type")
+            memo = td.get("memo")
+            if memo and mtype:
+                return f"{mtype.upper()}: {memo}"
+            if memo:
+                return str(memo)
+        except Exception as exc:
+            logger.debug("XLM memo %s: %s", txh, exc)
+        return None
+
     async def _tick(self):
-        rows = await self.db.get_addresses_by_chain("xlm")
+        rows = await addr_cache.chain("xlm")
         if not rows:
-            await asyncio.sleep(self.cfg.poll)
+            await asyncio.sleep(Config.IDLE_POLL)
             return
-        alerts: List[Alert] = []
+        # Pass 1: gather eligible payment records per address (and advance the
+        # per-address cursor). Memo lives on the transaction, not the payment
+        # record, so we defer those lookups to one concurrent, de-duplicated
+        # batch instead of a serial request per record (the old N+1 hot path).
+        candidates: List[Tuple[int, str, dict, Direction]] = []
         for r in rows:
             addr = r["address"]
             cursor = None
@@ -1020,48 +1182,60 @@ class XLMMonitor(Monitor):
                 params["cursor"] = cursor
             try:
                 resp = await self._client.get(f"{self.cfg.api}/accounts/{addr}/payments", params=params)
+                resp.raise_for_status()
                 data = resp.json()
             except Exception as exc:
+                self.last_error = f"horizon: {str(exc)[:160]}"
                 logger.debug("XLM API: %s", exc)
                 continue
             records = data.get("_embedded", {}).get("records", [])
-            for record_index, rec in enumerate(records):
+            for rec in records:
                 txh = rec.get("transaction_hash")
-                if not txh:
+                if not txh or rec.get("type") not in ("payment", "path_payment"):
                     continue
                 direction = Direction.IN if rec.get("to") == addr else (Direction.OUT if rec.get("from") == addr else None)
-                if direction is None or rec.get("type") not in ("payment", "path_payment"):
+                if direction is None:
                     continue
-                memo = None
-                try:
-                    td = (await self._client.get(f"{self.cfg.api}/transactions/{txh}")).json()
-                    if td.get("memo_type") and td.get("memo"):
-                        memo = f"{td['memo_type'].upper()}: {td['memo']}"
-                except Exception:
-                    pass
-                atype = rec.get("asset_type")
-                if atype == "native":
-                    asset = "XLM"
-                else:
-                    code = rec.get("asset_code", "ASSET")
-                    issuer = rec.get("asset_issuer", "")
-                    asset = f"{code}" + (f" ({issuer[:4]}...{issuer[-4:]})" if issuer else "")
-                amt = Decimal(rec.get("amount", "0"))
-                title = "Outgoing XLM" if direction == Direction.OUT else "Incoming XLM"
-                if asset != "XLM":
-                    title = "Outgoing Asset" if direction == Direction.OUT else "Incoming Asset"
-                alerts.append(Alert(
-                    chat_id=r["chat_id"], chain_key=self.key, title=title,
-                    amount_str=f"{amt:,.7f}".rstrip("0").rstrip("."),
-                    asset=asset, from_addr=rec.get("from", "?"), to_addr=rec.get("to", "?"),
-                    tx_hash=txh, direction=direction, memo=memo, log_index=record_index,
-                    contract_addr=rec.get("asset_issuer") if atype != "native" else None,
-                ))
+                candidates.append((r["chat_id"], addr, rec, direction))
             if records:
                 # asc -> records are oldest-first, so the newest fetched is the
                 # LAST one. desc (first poll only) -> newest is the FIRST one.
                 newest = records[-1] if cursor else records[0]
                 await self.db.execute("INSERT OR REPLACE INTO chain_state (chain,last_state) VALUES (?,?)", (f"xlm_{addr}", newest.get("paging_token")))
+
+        # Pass 2: one concurrent, unique memo fetch per transaction hash.
+        unique_txs = list({rec["transaction_hash"] for _, _, rec, _ in candidates})
+        memo_map: Dict[str, Optional[str]] = {}
+        if unique_txs:
+            memos = await asyncio.gather(*(self._fetch_memo(t) for t in unique_txs))
+            memo_map = dict(zip(unique_txs, memos))
+
+        alerts: List[Alert] = []
+        for chat_id, addr, rec, direction in candidates:
+            txh = rec["transaction_hash"]
+            atype = rec.get("asset_type")
+            if atype == "native":
+                asset = "XLM"
+            else:
+                code = rec.get("asset_code", "ASSET")
+                issuer = rec.get("asset_issuer", "")
+                asset = f"{code}" + (f" ({issuer[:4]}...{issuer[-4:]})" if issuer else "")
+            amt = Decimal(rec.get("amount", "0"))
+            title = "Outgoing XLM" if direction == Direction.OUT else "Incoming XLM"
+            if asset != "XLM":
+                title = "Outgoing Asset" if direction == Direction.OUT else "Incoming Asset"
+            # paging_token is a stable per-operation cursor -> robust dedup.
+            try:
+                log_index = int(rec.get("paging_token", "0"))
+            except (TypeError, ValueError):
+                log_index = -1
+            alerts.append(Alert(
+                chat_id=chat_id, chain_key=self.key, title=title,
+                amount_str=f"{amt:,.7f}".rstrip("0").rstrip("."),
+                asset=asset, from_addr=rec.get("from", "?"), to_addr=rec.get("to", "?"),
+                tx_hash=txh, direction=direction, memo=memo_map.get(txh), log_index=log_index,
+                contract_addr=rec.get("asset_issuer") if atype != "native" else None,
+            ))
         await self._send_batch(alerts)
         await asyncio.sleep(self.cfg.poll)
 
@@ -1099,14 +1273,17 @@ class SOLMonitor(Monitor):
         while self.running:
             try:
                 await self._tick()
+                self.last_ok = time.monotonic()
+                self.last_error = None
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                 logger.exception("SOL: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        rows = await self.db.get_addresses_by_chain("sol")
+        rows = await addr_cache.chain("sol")
         if not rows:
-            await asyncio.sleep(self.cfg.poll)
+            await asyncio.sleep(Config.IDLE_POLL)
             return
         alerts: List[Alert] = []
         for r in rows:
@@ -1116,9 +1293,6 @@ class SOLMonitor(Monitor):
             if st and st["last_state"]:
                 last_signature = st["last_state"]
             sig_params = {"limit": 10}
-            if last_signature:
-                # Fetch signatures newer than the last processed signature.
-                sig_params["until"] = last_signature
             try:
                 resp = await self._client.post(self.cfg.rpc, json={
                     "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
@@ -1126,11 +1300,22 @@ class SOLMonitor(Monitor):
                 })
                 sigs = resp.json().get("result", [])
             except Exception as exc:
+                self.last_error = f"solana-rpc: {str(exc)[:160]}"
                 logger.debug("SOL RPC: %s", exc)
                 continue
             if not sigs:
                 continue
+            # Results are newest-first. The "until" parameter pages toward
+            # OLDER history, so it must not be used to find new activity:
+            # process everything above the last cursor and stop at it.
+            fresh: List[dict] = []
             for si in sigs:
+                if si["signature"] == last_signature:
+                    break
+                fresh.append(si)
+            if not fresh:
+                continue
+            for si in fresh:
                 sig = si["signature"]
                 try:
                     tx = (await self._client.post(self.cfg.rpc, json={
@@ -1240,14 +1425,17 @@ class TRONMonitor(Monitor):
         while self.running:
             try:
                 await self._tick()
+                self.last_ok = time.monotonic()
+                self.last_error = None
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                 logger.exception("TRON: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        rows = await self.db.get_addresses_by_chain("tron")
+        rows = await addr_cache.chain("tron")
         if not rows:
-            await asyncio.sleep(self.cfg.poll)
+            await asyncio.sleep(Config.IDLE_POLL)
             return
         alerts: List[Alert] = []
         for r in rows:
@@ -1260,6 +1448,7 @@ class TRONMonitor(Monitor):
                 # detection (both directions) without visible=true.
                 data = (await self._client.get(f"{self.cfg.api}/accounts/{addr}/transactions", params={"limit": 10, "order_by": "block_timestamp,desc", "visible": "true"})).json()
             except Exception as exc:
+                self.last_error = f"trongrid: {str(exc)[:160]}"
                 logger.debug("TRON native: %s", exc)
                 data = {"data": []}
             for tx_index, tx in enumerate(data.get("data", [])):
@@ -1275,13 +1464,15 @@ class TRONMonitor(Monitor):
                 direction = Direction.IN if to_addr == addr else (Direction.OUT if owner == addr else None)
                 if direction is None:
                     continue
+                # TronGrid carries exchange memos as hex-encoded data.
+                memo = _decode_hex_memo(p.get("data"))
                 a = Decimal(amount) / Decimal(10 ** self.cfg.decimals)
                 alerts.append(Alert(
                     chat_id=r["chat_id"], chain_key=self.key,
                     title="Outgoing TRX" if direction == Direction.OUT else "Incoming TRX",
                     amount_str=f"{a:,.6f}".rstrip("0").rstrip("."),
                     asset=self.cfg.native, from_addr=owner or "?", to_addr=to_addr or addr,
-                    tx_hash=txh, direction=direction, log_index=tx_index,
+                    tx_hash=txh, direction=direction, log_index=tx_index, memo=memo,
                 ))
             # TRC20
             try:
@@ -1346,14 +1537,17 @@ class BTCMonitor(Monitor):
         while self.running:
             try:
                 await self._tick()
+                self.last_ok = time.monotonic()
+                self.last_error = None
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                 logger.exception("BTC: %s", exc)
                 await asyncio.sleep(5)
 
     async def _tick(self):
-        rows = await self.db.get_addresses_by_chain("btc")
+        rows = await addr_cache.chain("btc")
         if not rows:
-            await asyncio.sleep(self.cfg.poll)
+            await asyncio.sleep(Config.IDLE_POLL)
             return
         alerts: List[Alert] = []
         for r in rows:
@@ -1425,7 +1619,10 @@ class SUIMonitor(Monitor):
         while self.running:
             try:
                 await self._tick()
+                self.last_ok = time.monotonic()
+                self.last_error = None
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                 logger.exception("SUI: %s", exc)
                 await asyncio.sleep(5)
 
@@ -1438,7 +1635,10 @@ class SUIMonitor(Monitor):
         return p.get("result", {})
 
     async def _tick(self):
-        rows = await self.db.get_addresses_by_chain("sui")
+        rows = await addr_cache.chain("sui")
+        if not rows:
+            await asyncio.sleep(Config.IDLE_POLL)
+            return
         alerts: List[Alert] = []
         for r in rows:
             addr = r["address"]
@@ -1576,6 +1776,7 @@ tz_helper: TZHelper
 notifier: Notifier
 evm_cache: EVMCache
 spl_cache: SPLCache
+addr_cache: AddrCache
 monitors: Dict[str, Monitor] = {}
 app_start: Optional[datetime] = None
 ask_sessions: Dict[int, float] = {}
@@ -1976,9 +2177,10 @@ async def cb_hist(cb: types.CallbackQuery):
         badge = "🔴 OUT" if r["direction"] == "outgoing" else "🟢 IN"
         dt = datetime.fromisoformat(r["created_at"])
         ts = await tz_helper.fmt(cid, dt, stored_tz=r["notification_timezone"])
+        text += f"{i}. {badge} {emoji} <code>{r['asset']}</code> | <code>{r['amount']}</code>\n   └ <a href='{(cfg.explorer if cfg else '')}{r['tx_hash']}'>{r['tx_hash']}</a> | {ts}\n"
         if r["contract_addr"]:
-            text += f"Token contract: <code>{r['contract_addr']}</code>\n"
-        text += f"{i}. {badge} {emoji} <code>{r['asset']}</code> | <code>{r['amount']}</code>\n   └ <a href='{(cfg.explorer if cfg else '')}{r['tx_hash']}'>{r['tx_hash']}</a> | {ts}\n\n"
+            text += f"     Token contract: <code>{r['contract_addr']}</code>\n"
+        text += "\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑️ Clear", callback_data="clr_conf"),
          InlineKeyboardButton(text="🔙 Back", callback_data="m_back")]
@@ -2048,10 +2250,12 @@ async def cb_help(cb: types.CallbackQuery):
         "<b>/timezone</b> <code>&lt;zone&gt;</code>\n"
         "<b>/stats</b> — Your stats\n"
         "<b>/status</b> — Health check\n"
+        "<b>/ask</b> — Local project assistant\n"
         "<b>/test</b> — Sample alert\n"
         "<b>/export</b> — Export addresses\n"
         "<b>/chains</b> — Supported chains\n"
         "<b>/help</b> — This message\n\n"
+        "<i>Admins:</i> <code>/admin</code>, <code>/admin_user</code>, <code>/broadcast</code>, <code>/ban</code>, <code>/unban</code>\n"
         "<i>💡 Paste any address — bot figures out the chain!</i>\n"
         "<i>💡 Burn addresses blocked on all chains.</i>\n"
         "<i>💡 Full IN+OUT detection on ALL chains.</i>",
@@ -2166,6 +2370,7 @@ async def cmd_add(msg: types.Message):
         return
 
     await db.execute("INSERT INTO addresses (chat_id, address, chain, label) VALUES (?,?,?,?)", (cid, addr, chain, label))
+    addr_cache.invalidate()
     name = "All EVM" if chain == "evm" else (cfg.name if cfg else chain)
     emoji = "⛓️" if chain == "evm" else (cfg.emoji if cfg else "⬜")
     await reply_del(
@@ -2249,6 +2454,7 @@ async def cmd_remove(msg: types.Message):
     addr = parts[2].strip().lower()
     cid = msg.chat.id
     cur = await db.execute("DELETE FROM addresses WHERE chat_id=? AND chain=? AND address=? COLLATE NOCASE", (cid, chain, addr))
+    addr_cache.invalidate()
     if cur.rowcount:
         name = "All EVM" if chain == "evm" else (CHAINS_BY_KEY[chain].name if chain in CHAINS_BY_KEY else chain)
         await reply_del(msg, f"✅ Removed from {name}.", parse_mode=ParseMode.HTML)
@@ -2264,6 +2470,7 @@ async def cb_rm(cb: types.CallbackQuery):
         await cb.answer("Already removed", show_alert=True)
         return
     await db.execute("DELETE FROM addresses WHERE id=? AND chat_id=?", (aid, cid))
+    addr_cache.invalidate()
     await cb.message.edit_text(f"✅ Removed <code>{row['address']}</code>.", parse_mode=ParseMode.HTML)
     await cb.answer("Removed")
 
@@ -2420,8 +2627,8 @@ async def cmd_status(msg: types.Message):
     if app_start:
         s = max(0, int((datetime.now() - app_start).total_seconds()))
         uptime = f"{s // 3600}h {(s % 3600) // 60}m"
-    online = sum(1 for m in monitors.values() if m.running and (getattr(m, "_w3", True) is not None))
-    offline = max(0, len(monitors) - online)
+    online = sum(1 for em, _ in (m.health() for m in monitors.values()) if em == "🟢")
+    attention = max(0, len(monitors) - online)
 
     text = (
         f"<b>📊 Status</b>\n\n"
@@ -2430,7 +2637,7 @@ async def cmd_status(msg: types.Message):
         f"  IN: <code>{in24['c']}</code> | OUT: <code>{out24['c']}</code>\n"
         f"<b>Notifications:</b> <code>{'ON' if pref['enabled'] else 'PAUSED'}</code>\n"
         f"<b>Networks:</b> <code>{len(_CHAINS)}</code>\n"
-        f"<b>Health:</b> <code>{online} online</code> / <code>{offline} reconnecting</code>\n"
+        f"<b>Health:</b> <code>{online} online</code> / <code>{attention} need attention</code>\n"
         f"<b>Uptime:</b> <code>{uptime}</code>\n"
     )
     if latest:
@@ -2446,7 +2653,14 @@ async def cmd_status(msg: types.Message):
             if not cfg:
                 continue
             m = monitors.get(k)
-            state = "🟢 polling" if m and m.running and (getattr(m, "_w3", True) is not None) else "🔴 reconnecting"
+            if m is None:
+                state = "⚪ no monitor"
+            else:
+                icon, detail = m.health()
+                state = f"{icon} {detail}"
+                rpc = getattr(m, "_rpc_url", None)
+                if rpc and icon in ("🟢", "🟡"):
+                    state += f" — <code>{rpc.split('//')[-1].split('/')[0]}</code>"
             text += f"{cfg.emoji} <b>{cfg.name}</b>: {state}\n"
     else:
         text += "\n<i>No addresses monitored yet.</i>"
@@ -2511,80 +2725,6 @@ async def cmd_chains(msg: types.Message):
         text += f"{c.emoji} <b>{c.name}</b> — <code>{c.key}</code> — <code>{c.native}</code> — <i>{note}</i>\n"
     await send_long(msg, text, parse_mode=ParseMode.HTML)
 
-# ── Local project assistant ────────────────────────
-
-def local_project_answer_legacy(question: str) -> str:
-    """Unused legacy assistant implementation kept out of the router."""
-    q = question.casefold().strip()
-    chain_names = ", ".join(c.name for c in _CHAINS)
-
-    if any(word in q for word in ("chain", "network", "support")):
-        return (
-            f"<b>Supported networks ({len(_CHAINS)})</b>\n\n"
-            f"{html.escape(chain_names)}\n\n"
-            "Use <code>/chains</code> for the complete formatted list."
-        )
-    if any(word in q for word in ("add", "monitor", "wallet", "address")):
-        return (
-            "<b>Add a wallet</b>\n\n"
-            "<code>/add &lt;address&gt; [label]</code>\n"
-            "Example: <code>/add 0x1234... Main wallet</code>\n\n"
-            "For an ambiguous address, use "
-            "<code>/add &lt;chain&gt; &lt;address&gt; [label]</code>."
-        )
-    if any(word in q for word in ("label", "rename", "name")):
-        return (
-            "Use <code>/label &lt;chain&gt; &lt;address&gt; &lt;label&gt;</code> "
-            "to create or change a custom wallet label."
-        )
-    if any(word in q for word in ("incoming", "outgoing", "outbound", "in and out", "transaction")):
-        return (
-            "The monitor detects both incoming and outgoing activity. "
-            "ERC-20, native transfers, and supported chain token transfers "
-            "include the sender, recipient, amount, transaction link, and contract address when available."
-        )
-    if any(word in q for word in ("contract", "ca", "token address")):
-        return "Token alerts include the token contract address as <b>CA</b> when the network provides it."
-    if any(word in q for word in ("admin", "ban", "unban", "spam")):
-        return (
-            "Administrators can use <code>/admin</code>, <code>/admin_user &lt;chat_id&gt;</code>, "
-            "<code>/ban &lt;chat_id&gt;</code>, and <code>/unban &lt;chat_id&gt;</code>. "
-            "Anti-spam limits apply to regular users and never to admins."
-        )
-    if any(word in q for word in ("history", "status", "alert", "notification")):
-        return (
-            "Use <code>/history</code> for recent alerts, <code>/status</code> for monitor health, "
-            "and <code>/stats</code> for your activity totals."
-        )
-    if any(word in q for word in ("timezone", "time", "ist", "utc")):
-        return "Use <code>/timezone &lt;zone&gt;</code>, for example <code>/timezone Asia/Kolkata</code>."
-    if any(word in q for word in ("rpc", "backup", "fallback", "connection")):
-        return (
-            "EVM networks use multiple RPC endpoints with retry and backoff. "
-            "If one endpoint fails, the monitor tries its configured backups automatically."
-        )
-    if any(word in q for word in ("private key", "security", "safe", "privacy")):
-        return (
-            "This bot is read-only: it monitors public wallet addresses and never asks for or stores private keys. "
-            "Keep your <code>.env</code> file private."
-        )
-    return (
-        "I can answer questions about this project locally. Try:\n"
-        "<code>/ask how do I add a wallet?</code>\n"
-        "<code>/ask which networks are supported?</code>\n"
-        "<code>/ask how are incoming transfers detected?</code>"
-    )
-
-
-# Legacy handler intentionally not registered; the primary /ask handler is above.
-async def cmd_ask_legacy(msg: types.Message):
-    question = (msg.text or "").partition(" ")[2].strip()
-    if not question:
-        await reply_del(msg, "Usage: <code>/ask your question</code>", parse_mode=ParseMode.HTML)
-        return
-    await reply_del(msg, local_project_answer(question), parse_mode=ParseMode.HTML)
-
-
 # ── /help ──────────────────────────────────────────
 
 @router.message(Command("help"))
@@ -2604,6 +2744,7 @@ async def cmd_help(msg: types.Message):
         "<b>🌍 /timezone</b> <code>&lt;zone&gt;</code> — Set timezone\n"
         "<b>📊 /stats</b> — Your statistics\n"
         "<b>📊 /status</b> — Monitor health\n"
+        "<b>💬 /ask</b> <code>&lt;question&gt;</code> — Local project assistant\n"
         "<b>🧪 /test</b> — Sample alert\n"
         "<b>📤 /export</b> — Export addresses\n"
         "<b>⛓️ /chains</b> — List networks\n"
@@ -2685,7 +2826,7 @@ async def cmd_broadcast(msg: types.Message):
     if len(parts) < 2:
         await reply_del(msg, "❌ <code>/broadcast message...</code>", parse_mode=ParseMode.HTML); return
     text = parts[1]
-    users = await db.fetchall("SELECT chat_id FROM users")
+    users = await db.fetchall("SELECT chat_id FROM users WHERE is_banned=0")
     sent = failed = 0
     for u in users:
         try:
@@ -2909,7 +3050,7 @@ async def cli_check():
             print(f"{c.key:<12} {'OK' if ok else 'FAIL':<5} {ok or '(all down)'}")
 
 async def main():
-    global db, tz_helper, notifier, evm_cache, spl_cache, monitors, app_start
+    global db, tz_helper, notifier, evm_cache, spl_cache, addr_cache, monitors, app_start
     app_start = datetime.now()
     asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
 
@@ -2918,6 +3059,7 @@ async def main():
         return
 
     db = DB(Config.DB_PATH)
+    addr_cache = AddrCache(db, Config.ADDR_CACHE_TTL)
     tz_helper = TZHelper(db)
     evm_cache = EVMCache()
     spl_cache = SPLCache()
