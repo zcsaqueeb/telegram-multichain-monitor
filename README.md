@@ -11,7 +11,8 @@ Monitor native assets and tokens, track incoming and outgoing transfers, and man
 - **Automatic chain detection** when adding wallets
 - **Native asset and token monitoring** with token metadata lookup
 - **Burn/dead-address protection** to prevent monitoring unrecoverable addresses
-- **Fast asynchronous polling** with concurrent EVM scans
+- **Memo/comment display** on TON, Stellar, Solana, and TRON alerts
+- **Fast asynchronous polling** with concurrent EVM scans and RPC failover
 - **SQLite persistence** with WAL mode, batching, and optimized caching
 - **Duplicate-alert prevention** and rate limiting
 - **Per-user timezone and notification controls**
@@ -63,6 +64,9 @@ DB_PATH=data/monitor.db
 TON_API_KEY=your_tonapi_key
 AUTO_DELETE_DELAY=30
 # TELEGRAM_REQUEST_TIMEOUT=60
+# RPC_TIMEOUT=20           # per-request timeout for blockchain RPC calls
+# EVM_MAX_BLOCKS=10        # max blocks scanned per EVM tick (catch-up cap)
+# IDLE_POLL=30             # poll gap (s) for chains with no monitored wallets
 ```
 
 Start the monitor:
@@ -135,8 +139,11 @@ Each custom chain requires `name`, `native`, `rpc`, and `explorer`. `chain_id`, 
 ## Performance design
 
 - Async HTTP and blockchain requests
-- Concurrent token metadata and EVM transfer checks
-- Batched database writes and deduplication
+- Address-filtered `eth_getLogs` queries (public RPCs reject chain-wide log scans, which previously kept chains like BSC in a reconnect loop)
+- Concurrent raw JSON-RPC block fetches instead of sequential full-block formatting
+- Per-tick TON/Solana memos, Stellar memo lookups batched and deduplicated per transaction
+- Batched database writes and deduplication, plus a shared TTL cache for monitored-address lists
+- Idle backoff: chains with no monitored wallets poll every 30s instead of every 2-5s
 - SQLite WAL mode with a 64 MB cache
 - TTL caches for user preferences, timezones, and token metadata
 - Compiled address patterns and constant-time burn-address lookups
